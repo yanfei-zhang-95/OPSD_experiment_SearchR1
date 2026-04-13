@@ -64,7 +64,7 @@ def search(query: str):
             "topk": 3,
             "return_scores": True
         }
-    results = requests.post("http://127.0.0.1:8000/retrieve", json=payload).json()['result']
+    results = requests.post("http://127.0.0.1:8085/retrieve", json=payload).json()['result']
                 
     def _passages2string(retrieval_result):
         format_reference = ''

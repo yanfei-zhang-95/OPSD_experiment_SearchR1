@@ -198,6 +198,12 @@ def main_task(config):
                             val_reward_fn=val_reward_fn,
                             )
     trainer.init_workers()
+    
+    # Inject the actor rollout worker group into the reward function for OPSD
+    # This avoids modifying the internal verl/trainer/ppo/ray_trainer.py
+    if hasattr(trainer.reward_fn, 'set_rollout_wg'):
+        trainer.reward_fn.set_rollout_wg(trainer.actor_rollout_wg)
+        
     trainer.fit()
 
 

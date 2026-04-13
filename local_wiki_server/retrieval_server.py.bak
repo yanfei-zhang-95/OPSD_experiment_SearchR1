@@ -3,6 +3,7 @@ import os
 import warnings
 from typing import List, Dict, Optional
 import argparse
+import threading
 
 import faiss
 import torch
@@ -117,8 +118,15 @@ class Encoder:
         query_emb = query_emb.detach().cpu().numpy()
         query_emb = query_emb.astype(np.float32, order="C")
         
+        # Clean up GPU memory
         del inputs, output
-        torch.cuda.empty_cache()
+        
+        # Memory cleanup strategy:
+        # - For batches: always cleanup (large memory usage)
+        # - For single queries: periodic cleanup (every N queries) to balance performance and memory
+        if len(query_list) > 1:
+            torch.cuda.empty_cache()
+        # Note: Single query cleanup is handled in _search method with periodic strategy
 
         return query_emb
 
@@ -209,10 +217,42 @@ class DenseRetriever(BaseRetriever):
         super().__init__(config)
         self.index = faiss.read_index(self.index_path)
         if config.faiss_gpu:
-            co = faiss.GpuMultipleClonerOptions()
-            co.useFloat16 = True
-            co.shard = True
-            self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
+            # Check if index is Flat, if so load in batches to avoid OOM
+            if isinstance(self.index, faiss.IndexFlat):
+                print(f"Loading {self.index.ntotal} vectors to GPU in batches...")
+                self.res = faiss.StandardGpuResources()
+                # Set temp memory to a larger value (2GB) to avoid memory management issues
+                # This helps prevent the 'p + size == head_' assertion failure
+                self.res.setTempMemory(2 * 1024 * 1024 * 1024)  # 2GB
+                # Use default stream to avoid concurrency issues
+                self.res.setDefaultNullStreamAllDevices()
+                
+                gpu_index_config = faiss.GpuIndexFlatConfig()
+                gpu_index_config.useFloat16 = True
+                gpu_index_config.device = 0
+                
+                if self.index.metric_type == faiss.METRIC_INNER_PRODUCT:
+                    gpu_index = faiss.GpuIndexFlatIP(self.res, self.index.d, gpu_index_config)
+                elif self.index.metric_type == faiss.METRIC_L2:
+                    gpu_index = faiss.GpuIndexFlatL2(self.res, self.index.d, gpu_index_config)
+                else:
+                    # Fallback
+                    co = faiss.GpuMultipleClonerOptions()
+                    co.useFloat16 = True
+                    co.shard = True
+                    gpu_index = faiss.index_cpu_to_all_gpus(self.index, co=co)
+                
+                if isinstance(gpu_index, (faiss.GpuIndexFlatIP, faiss.GpuIndexFlatL2)):
+                    batch_size = 500000
+                    for i in tqdm(range(0, self.index.ntotal, batch_size), desc="Transferring to GPU"):
+                        batch_vectors = self.index.reconstruct_n(i, min(batch_size, self.index.ntotal - i))
+                        gpu_index.add(batch_vectors)
+                    self.index = gpu_index
+            else:
+                co = faiss.GpuMultipleClonerOptions()
+                co.useFloat16 = True
+                co.shard = True
+                self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
 
         self.corpus = load_corpus(self.corpus_path)
         self.encoder = Encoder(
@@ -224,12 +264,33 @@ class DenseRetriever(BaseRetriever):
         )
         self.topk = config.retrieval_topk
         self.batch_size = config.retrieval_batch_size
+        # Add lock to protect GPU operations from concurrent access
+        self._search_lock = threading.Lock()
+        # Counter for periodic cache cleanup (every N queries)
+        self._query_count = 0
+        self._cleanup_interval = 400  # Clean cache every 400 queries
 
     def _search(self, query: str, num: int = None, return_score: bool = False):
         if num is None:
             num = self.topk
         query_emb = self.encoder.encode(query)
-        scores, idxs = self.index.search(query_emb, k=num)
+        
+        # Use lock to protect GPU search operation
+        with self._search_lock:
+            # For single query, we can skip some synchronizations for better performance
+            # GPU search is typically fast enough that explicit sync isn't always needed
+            scores, idxs = self.index.search(query_emb, k=num)
+            # Only sync if we need to ensure completion before CPU access
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
+            # Periodic cache cleanup for single queries
+            # This balances performance (avoiding cleanup every time) with memory management
+            self._query_count += 1
+            if self._query_count >= self._cleanup_interval:
+                torch.cuda.empty_cache()
+                self._query_count = 0
+        
         idxs = idxs[0]
         scores = scores[0]
         results = load_docs(self.corpus, idxs)
@@ -249,7 +310,20 @@ class DenseRetriever(BaseRetriever):
         for start_idx in tqdm(range(0, len(query_list), self.batch_size), desc='Retrieval process: '):
             query_batch = query_list[start_idx:start_idx + self.batch_size]
             batch_emb = self.encoder.encode(query_batch)
-            batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
+            
+            # Use lock to protect GPU search operation from concurrent access
+            with self._search_lock:
+                # Synchronize before search to ensure all operations are complete
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
+                
+                # Synchronize after search to ensure search is complete before converting
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            
+            # Convert to CPU tensors/lists outside the lock
             batch_scores = batch_scores.tolist()
             batch_idxs = batch_idxs.tolist()
 
@@ -262,8 +336,12 @@ class DenseRetriever(BaseRetriever):
             results.extend(batch_results)
             scores.extend(batch_scores)
             
+            # Clean up GPU memory
             del batch_emb, batch_scores, batch_idxs, query_batch, flat_idxs, batch_results
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                # Additional synchronization to ensure cleanup
+                torch.cuda.synchronize()
             
         if return_score:
             return results, scores
@@ -294,7 +372,7 @@ class Config:
         corpus_path: str = "./data/corpus.jsonl",
         dataset_path: str = "./data",
         data_split: str = "train",
-        faiss_gpu: bool = True,
+        faiss_gpu: bool = False,
         retrieval_model_path: str = "./model",
         retrieval_pooling_method: str = "mean",
         retrieval_query_max_length: int = 256,
@@ -337,36 +415,84 @@ def retrieve_endpoint(request: QueryRequest):
     if not request.topk:
         request.topk = config.retrieval_topk  # fallback to default
 
-    # Perform batch retrieval
-    results, scores = retriever.batch_search(
-        query_list=request.queries,
-        num=request.topk,
-        return_score=request.return_scores
-    )
-    
-    # Format response
-    resp = []
-    for i, single_result in enumerate(results):
+    # Optimize for single query: use direct search instead of batch_search
+    # This avoids batch processing overhead and progress bars for single queries
+    if len(request.queries) == 1:
+    # if False:
+        # Single query fast path
+        single_result = retriever.search(
+            query=request.queries[0],
+            num=request.topk,
+            return_score=request.return_scores
+        )
+        
+        # Format response for single query
         if request.return_scores:
-            # If scores are returned, combine them with results
+            results, scores = single_result
             combined = []
-            for doc, score in zip(single_result, scores[i]):
+            for doc, score in zip(results, scores):
                 combined.append({"document": doc, "score": score})
-            resp.append(combined)
+            return {"result": [combined]}
         else:
-            resp.append(single_result)
-    return {"result": resp}
+            return {"result": [single_result]}
+    else:
+        # Multiple queries: use batch search
+        batch_result = retriever.batch_search(
+            query_list=request.queries,
+            num=request.topk,
+            return_score=request.return_scores
+        )
+        
+        # Handle return value based on return_score flag
+        if request.return_scores:
+            results, scores = batch_result
+        else:
+            results = batch_result
+            scores = None
+        
+        # Format response
+        resp = []
+        for i, single_result in enumerate(results):
+            if request.return_scores and scores:
+                # If scores are returned, combine them with results
+                combined = []
+                for doc, score in zip(single_result, scores[i]):
+                    combined.append({"document": doc, "score": score})
+                resp.append(combined)
+            else:
+                resp.append(single_result)
+        return {"result": resp}
 
 
 if __name__ == "__main__":
     
+    data_path = "/data/yanfeizhang/SES/local_wiki_server/wiki-18-e5-index"
+
     parser = argparse.ArgumentParser(description="Launch the local faiss retriever.")
-    parser.add_argument("--index_path", type=str, default="/home/peterjin/mnt/index/wiki-18/e5_Flat.index", help="Corpus indexing file.")
-    parser.add_argument("--corpus_path", type=str, default="/home/peterjin/mnt/data/retrieval-corpus/wiki-18.jsonl", help="Local corpus file.")
-    parser.add_argument("--topk", type=int, default=3, help="Number of retrieved passages for one query.")
-    parser.add_argument("--retriever_name", type=str, default="e5", help="Name of the retriever model.")
-    parser.add_argument("--retriever_model", type=str, default="intfloat/e5-base-v2", help="Path of the retriever model.")
-    parser.add_argument('--faiss_gpu', action='store_true', help='Use GPU for computation')
+    
+    parser.add_argument("--index_path", 
+        type=str, 
+        default=f"{data_path}/e5_Flat.index", 
+        help="Corpus indexing file.")
+    parser.add_argument("--corpus_path", 
+        type=str, 
+        default=f"{data_path}/wiki-18.jsonl", 
+        help="Local corpus file.")
+    parser.add_argument("--topk", 
+        type=int, 
+        default=10, 
+        help="Number of retrieved passages for one query.")
+    parser.add_argument("--retriever_name", 
+        type=str, 
+        default="e5", help="Name of the retriever model.")
+    parser.add_argument("--retriever_model", 
+        type=str, 
+        default=f"{data_path}/intfloat/e5-base-v2", 
+        help="Path of the retriever model.")
+    parser.add_argument('--faiss_gpu', 
+        action='store_true', 
+        default=True,
+        help='Use GPU for computation')
 
     args = parser.parse_args()
     
@@ -380,13 +506,13 @@ if __name__ == "__main__":
         faiss_gpu=args.faiss_gpu,
         retrieval_model_path=args.retriever_model,
         retrieval_pooling_method="mean",
-        retrieval_query_max_length=256,
+        retrieval_query_max_length=512,
         retrieval_use_fp16=True,
-        retrieval_batch_size=512,
+        retrieval_batch_size=128,
     )
 
     # 2) Instantiate a global retriever so it is loaded once and reused.
     retriever = get_retriever(config)
     
-    # 3) Launch the server. By default, it listens on http://127.0.0.1:8085
+    # 3) Launch the server. By default, it listens on http://127.0.0.1:8000
     uvicorn.run(app, host="0.0.0.0", port=8085)

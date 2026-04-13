@@ -433,6 +433,173 @@ class RayPPOTrainer(object):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
 
+    def _build_left_padded_logprob_batch(self, prompt_ids_list, response_ids_list, micro_batch_size=128):
+        pad_token_id = self.tokenizer.pad_token_id
+        batch_size = len(prompt_ids_list)
+        max_prompt_len = max(x.numel() for x in prompt_ids_list)
+        max_resp_len = max(x.numel() for x in response_ids_list)
+        seq_len = max_prompt_len + max_resp_len
+
+        input_ids = torch.full((batch_size, seq_len), pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((batch_size, seq_len), dtype=torch.long)
+        responses = torch.full((batch_size, max_resp_len), pad_token_id, dtype=torch.long)
+
+        for i, (prompt_ids, response_ids) in enumerate(zip(prompt_ids_list, response_ids_list)):
+            p_len = prompt_ids.numel()
+            r_len = response_ids.numel()
+            input_ids[i, max_prompt_len - p_len:max_prompt_len] = prompt_ids
+            input_ids[i, max_prompt_len:max_prompt_len + r_len] = response_ids
+            attention_mask[i, max_prompt_len - p_len:max_prompt_len + r_len] = 1
+            responses[i, :r_len] = response_ids
+
+        position_ids = attention_mask.cumsum(dim=1) - 1
+        position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+
+        return DataProto.from_dict(
+            tensors={
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'position_ids': position_ids,
+                'responses': responses,
+            },
+            meta_info={
+                'micro_batch_size': micro_batch_size,
+                'temperature': 1.0,
+                'use_dynamic_bsz': False,
+                'max_token_len': seq_len,
+            }
+        )
+
+    def _apply_opsd_token_level_kl(self, batch: DataProto):
+        if 'opsd_kl_data' not in batch.non_tensor_batch:
+            return batch
+
+        opsd_kl_data = batch.non_tensor_batch['opsd_kl_data']
+        if opsd_kl_data is None or len(opsd_kl_data) == 0:
+            return batch
+
+        teacher_prompt_ids = []
+        teacher_response_ids = []
+        teacher_meta = []
+        debug_examples = []
+
+        for batch_idx in range(len(batch)):
+            step_list = opsd_kl_data[batch_idx]
+            if step_list is None:
+                continue
+            for step_idx, step in enumerate(step_list):
+                hint = step.get('hint', '').strip()
+                current_state = step.get('current_state_str', '')
+                action_str = step.get('action_str', '')
+                if not hint or not action_str:
+                    continue
+
+                teacher_prompt = current_state + "\n\nHint: " + hint
+                prompt_ids = torch.tensor(
+                    self.tokenizer.encode(teacher_prompt, add_special_tokens=False),
+                    dtype=torch.long
+                )
+                response_ids = torch.tensor(
+                    self.tokenizer.encode(action_str, add_special_tokens=False),
+                    dtype=torch.long
+                )
+                if response_ids.numel() == 0:
+                    continue
+
+                teacher_prompt_ids.append(prompt_ids)
+                teacher_response_ids.append(response_ids)
+                teacher_meta.append({
+                    'batch_idx': batch_idx,
+                    'step_idx': step_idx,
+                    'resp_len': response_ids.numel(),
+                    'action_token_start_idx': step['action_token_start_idx'],
+                    'action_token_end_idx': step['action_token_end_idx'],
+                })
+                if batch_idx == 0 and len(debug_examples) < 3:
+                    debug_examples.append({
+                        'step_idx': step_idx,
+                        'teacher_prompt': teacher_prompt,
+                        'action_str': action_str,
+                        'hint': hint,
+                        'action_token_start_idx': step['action_token_start_idx'],
+                        'action_token_end_idx': step['action_token_end_idx'],
+                    })
+
+        if not teacher_meta:
+            return batch
+
+        teacher_batch = self._build_left_padded_logprob_batch(
+            teacher_prompt_ids,
+            teacher_response_ids,
+            micro_batch_size=self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size,
+        )
+        for ex in debug_examples:
+            print(
+                "[OPSD KL DEBUG] Teacher Example\n"
+                f"[Step Idx] {ex['step_idx']}\n"
+                f"[Teacher Prompt]\n{ex['teacher_prompt']}\n"
+                f"[Action]\n{ex['action_str']}\n"
+                f"[Hint]\n{ex['hint']}\n"
+                f"[Action Token Span] {ex['action_token_start_idx']} -> {ex['action_token_end_idx']}\n"
+                + "-" * 80
+            )
+        teacher_batch_padded, pad_size = pad_dataproto_to_divisor(
+            teacher_batch, self.actor_rollout_wg.world_size
+        )
+        teacher_logprob_output_padded = self.actor_rollout_wg.compute_log_prob(teacher_batch_padded)
+        teacher_logprob_output = unpad_dataproto(teacher_logprob_output_padded, pad_size=pad_size)
+        teacher_log_probs = teacher_logprob_output.batch['old_log_probs']
+
+        token_level_scores = batch.batch['token_level_scores'].clone()
+        old_log_probs = batch.batch['old_log_probs']
+
+        for meta, teacher_lp in zip(teacher_meta, teacher_log_probs):
+            batch_idx = meta['batch_idx']
+            action_start = meta['action_token_start_idx']
+            action_end = meta['action_token_end_idx']
+            resp_len = meta['resp_len']
+            if action_end < action_start:
+                continue
+
+            student_lp = old_log_probs[batch_idx, action_start:action_end + 1]
+            teacher_lp = teacher_lp[:resp_len]
+            shared_len = min(student_lp.numel(), teacher_lp.numel())
+            if shared_len <= 0:
+                continue
+
+            student_lp = student_lp[:shared_len]
+            teacher_lp = teacher_lp[:shared_len]
+
+            # Smooth the approximate KL weighting over sampled tokens instead of
+            # collapsing onto the single largest positive delta.
+            delta = teacher_lp - student_lp
+            weights = torch.softmax(delta, dim=-1)
+
+            step_list = opsd_kl_data[batch_idx]
+            num_steps = max(1, len(step_list))
+            macro_reward = batch.batch['token_level_scores'][batch_idx].sum()
+            step_reward = macro_reward / num_steps
+
+            token_level_scores[batch_idx, action_start:action_start + shared_len] = step_reward * weights
+            if batch_idx == 0 and meta['step_idx'] < 3:
+                action_tokens = batch.batch['responses'][batch_idx, action_start:action_start + shared_len].tolist()
+                action_text = self.tokenizer.decode(action_tokens, skip_special_tokens=False)
+                print(
+                    "[OPSD KL DEBUG] Token-Level KL\n"
+                    f"[Step Idx] {meta['step_idx']}\n"
+                    f"[Action Text]\n{action_text}\n"
+                    f"[Student LogProb] {student_lp.tolist()}\n"
+                    f"[Teacher LogProb] {teacher_lp.tolist()}\n"
+                    f"[Delta] {delta.tolist()}\n"
+                    f"[Weights] {weights.tolist()}\n"
+                    f"[Macro Reward] {float(macro_reward):.6f}\n"
+                    f"[Step Reward] {float(step_reward):.6f}\n"
+                    + "-" * 80
+                )
+
+        batch.batch['token_level_scores'] = token_level_scores
+        return batch
+
     def _validate(self):
         """
         The training loop of PPO with global metric computation.
@@ -489,6 +656,11 @@ class RayPPOTrainer(object):
                 test_batch = test_batch.union(test_output_gen_batch)
 
                 # evaluate using reward_function
+                if hasattr(self.val_reward_fn, "set_rollout_wg"):
+                    self.val_reward_fn.set_rollout_wg(self.actor_rollout_wg)
+                else:
+                    self.val_reward_fn.actor_rollout_wg = self.actor_rollout_wg
+                    
                 # for certain reward function (e.g. sandbox), the generation can overlap with reward
                 reward_tensor = self.val_reward_fn(test_batch)
 
@@ -523,6 +695,11 @@ class RayPPOTrainer(object):
                         test_batch.batch[key] = test_batch.batch[key].long()
                     
                     # evaluate using reward_function
+                    if hasattr(self.val_reward_fn, "set_rollout_wg"):
+                        self.val_reward_fn.set_rollout_wg(self.actor_rollout_wg)
+                    else:
+                        self.val_reward_fn.actor_rollout_wg = self.actor_rollout_wg
+                        
                     # for certain reward function (e.g. sandbox), the generation can overlap with reward
                     reward_tensor = self.val_reward_fn(test_batch)
 
@@ -784,9 +961,17 @@ class RayPPOTrainer(object):
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
+                        # Inject the actor_rollout_wg for OPSD
+                        if hasattr(self.reward_fn, "set_rollout_wg"):
+                            self.reward_fn.set_rollout_wg(self.actor_rollout_wg)
+                        else:
+                            # Fallback: force inject as attribute if method not found
+                            self.reward_fn.actor_rollout_wg = self.actor_rollout_wg
+                            
                         # we combine with rule-based rm
                         reward_tensor = self.reward_fn(batch)
                         batch.batch['token_level_scores'] = reward_tensor
+                        batch = self._apply_opsd_token_level_kl(batch)
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.use_kl_loss:

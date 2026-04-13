@@ -159,6 +159,16 @@ class vLLMRollout(BaseRollout):
         for i in range(batch_size):
             idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
 
+        meta_kwargs = {}
+        for key in ['n', 'best_of', 'presence_penalty', 'frequency_penalty', 'repetition_penalty',
+                    'temperature', 'top_p', 'top_k', 'min_p', 'max_tokens', 'logprobs', 'detokenize',
+                    'ignore_eos']:
+            if key in prompts.meta_info:
+                meta_kwargs[key] = prompts.meta_info[key]
+
+        if 'max_token_len' in prompts.meta_info and 'max_tokens' not in meta_kwargs:
+            meta_kwargs['max_tokens'] = prompts.meta_info['max_token_len']
+
         do_sample = prompts.meta_info.get('do_sample', True)
         if not do_sample:
             kwargs = {
@@ -169,6 +179,7 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
+        kwargs.update(meta_kwargs)
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):

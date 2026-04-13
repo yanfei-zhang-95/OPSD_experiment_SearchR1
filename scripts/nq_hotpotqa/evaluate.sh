@@ -61,5 +61,5 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     max_turns=4 \
-    retriever.url="http://127.0.0.1:8000/retrieve" \
+    retriever.url="http://127.0.0.1:8085/retrieve" \
     retriever.topk=3

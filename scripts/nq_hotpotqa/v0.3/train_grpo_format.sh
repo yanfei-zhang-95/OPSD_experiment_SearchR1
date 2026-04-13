@@ -82,6 +82,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     reward_model.final_format_score=0.1 \
     reward_model.retrieval_score=0 \
     max_turns=4 \
-    retriever.url="http://127.0.0.1:8000/retrieve" \
+    retriever.url="http://127.0.0.1:8085/retrieve" \
     retriever.topk=3 \
     2>&1 | tee /home/peterjin/rl_logs/$EXPERIMENT_NAME.log

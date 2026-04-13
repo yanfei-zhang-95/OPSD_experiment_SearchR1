@@ -1,3 +1,31 @@
+比较主要的改动都在verl/trainer/ppo/ray_trainer.py还有verl/trainer/ppo/main_ppo.py里面；目前没有找到特别好的解耦方案，就先这么改进去了
+
+local wiki server我用了我原来在本地跑的一个，也是当时用search r1的这一套改的：
+
+在一个独立环境（retriever）里面启动，所有依赖装好
+
+conda create -n retriever python=3.10
+conda activate retriever
+
+# we recommend installing torch with conda for faiss-gpu
+conda install pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=12.1 -c pytorch -c nvidia
+pip install transformers datasets pyserini
+
+## install the gpu version faiss to guarantee efficient RL rollout
+conda install -c pytorch -c nvidia faiss-gpu=1.8.0
+
+## API function
+pip install uvicorn fastapi
+
+路径要注意改一下
+启动download.sh、download_model.py，下载所有数据集
+运行nq_search.py，把数据集给处理好
+然后启动retrieval_launch.sh，等待加载即可
+
+其他初始设置一切都参考search r1原设置即可
+
+
+————————————————————————
 # Search-R1: Train your LLMs to reason and call a search engine with reinforcement learning
 
 <div align="center">
