@@ -488,19 +488,17 @@ class RayPPOTrainer(object):
             if step_list is None:
                 continue
             for step_idx, step in enumerate(step_list):
-                hint = step.get('hint', '').strip()
-                current_state = step.get('current_state_str', '')
-                action_str = step.get('action_str', '')
-                if not hint or not action_str:
+                teacher_prompt = step.get('teacher_prompt', '')
+                clean_step_text = step.get('clean_step_text', '')
+                if not teacher_prompt or not clean_step_text:
                     continue
 
-                teacher_prompt = current_state + "\n\nHint: " + hint
                 prompt_ids = torch.tensor(
                     self.tokenizer.encode(teacher_prompt, add_special_tokens=False),
                     dtype=torch.long
                 )
                 response_ids = torch.tensor(
-                    self.tokenizer.encode(action_str, add_special_tokens=False),
+                    self.tokenizer.encode(clean_step_text, add_special_tokens=False),
                     dtype=torch.long
                 )
                 if response_ids.numel() == 0:
@@ -512,17 +510,17 @@ class RayPPOTrainer(object):
                     'batch_idx': batch_idx,
                     'step_idx': step_idx,
                     'resp_len': response_ids.numel(),
-                    'action_token_start_idx': step['action_token_start_idx'],
-                    'action_token_end_idx': step['action_token_end_idx'],
+                    'step_token_start_idx': step['token_start_idx'],
+                    'step_token_end_idx': step['clean_step_token_end_idx'],
+                    'reward_anchor_idx': step['token_end_idx'],
                 })
                 if batch_idx == 0 and len(debug_examples) < 3:
                     debug_examples.append({
                         'step_idx': step_idx,
                         'teacher_prompt': teacher_prompt,
-                        'action_str': action_str,
-                        'hint': hint,
-                        'action_token_start_idx': step['action_token_start_idx'],
-                        'action_token_end_idx': step['action_token_end_idx'],
+                        'teacher_response': clean_step_text,
+                        'step_token_start_idx': step['token_start_idx'],
+                        'step_token_end_idx': step['clean_step_token_end_idx'],
                     })
 
         if not teacher_meta:
@@ -538,11 +536,12 @@ class RayPPOTrainer(object):
                 "[OPSD KL DEBUG] Teacher Example\n"
                 f"[Step Idx] {ex['step_idx']}\n"
                 f"[Teacher Prompt]\n{ex['teacher_prompt']}\n"
-                f"[Action]\n{ex['action_str']}\n"
-                f"[Hint]\n{ex['hint']}\n"
-                f"[Action Token Span] {ex['action_token_start_idx']} -> {ex['action_token_end_idx']}\n"
+                f"[Teacher Response]\n{ex['teacher_response']}\n"
+                f"[Step Token Span] {ex['step_token_start_idx']} -> {ex['step_token_end_idx']}\n"
                 + "-" * 80
             )
+        
+        # breakpoint()
         teacher_batch_padded, pad_size = pad_dataproto_to_divisor(
             teacher_batch, self.actor_rollout_wg.world_size
         )
@@ -555,13 +554,13 @@ class RayPPOTrainer(object):
 
         for meta, teacher_lp in zip(teacher_meta, teacher_log_probs):
             batch_idx = meta['batch_idx']
-            action_start = meta['action_token_start_idx']
-            action_end = meta['action_token_end_idx']
+            step_start = meta['step_token_start_idx']
+            step_end = meta['step_token_end_idx']
             resp_len = meta['resp_len']
-            if action_end < action_start:
+            if step_end < step_start:
                 continue
 
-            student_lp = old_log_probs[batch_idx, action_start:action_end + 1]
+            student_lp = old_log_probs[batch_idx, step_start:step_end + 1]
             teacher_lp = teacher_lp[:resp_len]
             shared_len = min(student_lp.numel(), teacher_lp.numel())
             if shared_len <= 0:
@@ -580,14 +579,16 @@ class RayPPOTrainer(object):
             macro_reward = batch.batch['token_level_scores'][batch_idx].sum()
             step_reward = macro_reward / num_steps
 
-            token_level_scores[batch_idx, action_start:action_start + shared_len] = step_reward * weights
+            reward_anchor_idx = meta['reward_anchor_idx']
+            token_level_scores[batch_idx, reward_anchor_idx] = 0.0
+            token_level_scores[batch_idx, step_start:step_start + shared_len] = step_reward * weights
             if batch_idx == 0 and meta['step_idx'] < 3:
-                action_tokens = batch.batch['responses'][batch_idx, action_start:action_start + shared_len].tolist()
-                action_text = self.tokenizer.decode(action_tokens, skip_special_tokens=False)
+                step_tokens = batch.batch['responses'][batch_idx, step_start:step_start + shared_len].tolist()
+                step_text = self.tokenizer.decode(step_tokens, skip_special_tokens=False)
                 print(
                     "[OPSD KL DEBUG] Token-Level KL\n"
                     f"[Step Idx] {meta['step_idx']}\n"
-                    f"[Action Text]\n{action_text}\n"
+                    f"[Step Text]\n{step_text}\n"
                     f"[Student LogProb] {student_lp.tolist()}\n"
                     f"[Teacher LogProb] {teacher_lp.tolist()}\n"
                     f"[Delta] {delta.tolist()}\n"
@@ -596,6 +597,8 @@ class RayPPOTrainer(object):
                     f"[Step Reward] {float(step_reward):.6f}\n"
                     + "-" * 80
                 )
+            
+            # breakpoint()
 
         batch.batch['token_level_scores'] = token_level_scores
         return batch

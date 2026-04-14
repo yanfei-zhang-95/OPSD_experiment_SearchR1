@@ -24,10 +24,8 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 import re
 
 def _select_rm_score_fn(data_source):
-    if data_source in ['nq', 'triviaqa', 'popqa', 'hotpotqa', '2wikimultihopqa', 'musique', 'bamboogle']:
+    if data_source in ['nq', 'triviaqa', 'popqa', 'hotpotqa', '2wikimultihopqa', 'musique', 'bamboogle','r1searcher_stage2']:
         return qa_em.compute_score_em
-    else:
-        raise NotImplementedError
 
 
 class RewardManager():
@@ -40,12 +38,10 @@ class RewardManager():
         self.format_score = format_score
         self.actor_rollout_wg = None
         
-        # Regex to extract each logical step: 
-        # (optional think) + (search or answer) + (optional information)
-        self.step_pattern = re.compile(
-            r'(?:<think>(.*?)</think>\n?)?<(search|answer)>(.*?)</\2>(?:\n\n<information>(.*?)</information>\n\n)?',
-            re.DOTALL
-        )
+        # Split steps by observation boundaries instead of relying on optional
+        # <think> tags, which may be missing in some responses.
+        self.action_pattern = re.compile(r'<(search|answer)>(.*?)</\1>', re.DOTALL)
+        self.information_pattern = re.compile(r'<information>(.*?)</information>', re.DOTALL)
 
     def set_rollout_wg(self, wg):
         """Inject the rollout worker group to allow OPSD to compute hints and alpha scores."""
@@ -87,6 +83,43 @@ class RewardManager():
             return text
         return self.tokenizer.decode(token_ids[-max_tokens:], skip_special_tokens=True)
 
+    def _strip_information_tags(self, text: str) -> str:
+        return text.replace("<information>", "").replace("</information>", "")
+
+    def _remove_information_block(self, text: str) -> str:
+        return self.information_pattern.sub("", text)
+
+    def _split_response_into_steps(self, response_str: str):
+        """Split a trajectory by </information> and keep the final tail step."""
+        steps = []
+        cursor = 0
+        response_len = len(response_str)
+        info_end_tag = "</information>"
+
+        while cursor < response_len:
+            next_info_end = response_str.find(info_end_tag, cursor)
+            if next_info_end == -1:
+                step_end_char_idx = response_len
+            else:
+                step_end_char_idx = next_info_end + len(info_end_tag)
+
+            step_text = response_str[cursor:step_end_char_idx]
+            if step_text.strip():
+                steps.append({
+                    'step_start_char_idx': cursor,
+                    'step_end_char_idx': step_end_char_idx,
+                    'step_text': step_text,
+                })
+
+            if next_info_end == -1:
+                break
+
+            cursor = step_end_char_idx
+            while cursor < response_len and response_str[cursor].isspace():
+                cursor += 1
+
+        return steps
+
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
         
@@ -102,7 +135,6 @@ class RewardManager():
         all_scores = []
         valid_response_lengths = []
         
-        opsd_prompt_ids = []
         opsd_metadata = []
 
         batch_size = len(data)
@@ -142,23 +174,32 @@ class RewardManager():
                 
             # OPSD Step Extraction
             if self.actor_rollout_wg is not None:
-                matches = list(self.step_pattern.finditer(response_str))
-                for match in matches:
-                    step_think = match.group(1) or ""
-                    action_type = match.group(2)
-                    action_content = match.group(3)
-                    obs_content = match.group(4) or ""
-                    step_start_char_idx = match.start()
-                    
-                    end_char_idx = match.end()
+                step_segments = self._split_response_into_steps(response_str)
+                for step_segment in step_segments:
+                    step_start_char_idx = step_segment['step_start_char_idx']
+                    end_char_idx = step_segment['step_end_char_idx']
+                    step_text = step_segment['step_text']
+                    clean_step_text = self._remove_information_block(step_text)
+
+                    action_match = self.action_pattern.search(step_text)
+                    if action_match is None:
+                        continue
+
+                    action_type = action_match.group(1)
+                    action_content = action_match.group(2)
+                    obs_match = self.information_pattern.search(step_text)
+                    obs_content = obs_match.group(1) if obs_match else ""
+                    clean_step_end_char_idx = end_char_idx
+                    if obs_match is not None:
+                        clean_step_end_char_idx = step_start_char_idx + obs_match.start()
+
                     history_str = response_str[:step_start_char_idx]
-                    history_text = history_str
+                    history_text = self._strip_information_tags(history_str)
                     prefix_str = response_str[:end_char_idx]
+                    clean_prefix_str = self._strip_information_tags(prefix_str)
                     question_text = self._extract_question_text(data_item, prompt_str)
                     action_str = f"<{action_type}>{action_content}</{action_type}>"
                     current_state_str = history_text
-                    if step_think:
-                        current_state_str = current_state_str + f"<think>{step_think}</think>\n"
                     
                     # Approximate token index by tokenizing the prefix
                     start_prefix_tokens = self.tokenizer.encode(response_str[:step_start_char_idx], add_special_tokens=False)
@@ -167,6 +208,12 @@ class RewardManager():
                     token_end_idx = len(prefix_tokens) - 1
                     token_start_idx = max(0, min(token_start_idx, valid_response_length.item() - 1))
                     token_end_idx = max(0, min(token_end_idx, valid_response_length.item() - 1))
+
+                    clean_step_end_tokens = self.tokenizer.encode(
+                        response_str[:clean_step_end_char_idx], add_special_tokens=False
+                    )
+                    clean_step_token_end_idx = len(clean_step_end_tokens) - 1
+                    clean_step_token_end_idx = max(0, min(clean_step_token_end_idx, valid_response_length.item() - 1))
 
                     action_start_char_idx = response_str.find(action_str, step_start_char_idx, end_char_idx)
                     if action_start_char_idx < 0:
@@ -193,11 +240,11 @@ class RewardManager():
                         {"role": "user", "content": (
                             f"Question: {question_text}\n"
                             f"History so far: {history_text}\n"
-                            f"Current step action: <{action_type}>{action_content}</{action_type}>\n"
+                            f"Current step text:\n{clean_step_text}\n"
                             f"Current observation: {obs_content[:1000]}\n\n"
                             "Evaluate ONLY the current step based on the history so far.\n"
                             "Output exactly 3 numbered items in plain text:\n"
-                            "1. Progress: Is this step better, worse, or neutral for solving the question so far? Give a short reason.\n"
+                            "1. Progress: Given further observations, is this step better, worse, or neutral for solving the question so far? Give a short reason.\n"
                             "2. Findings: What did this step successfully find, and what important information is still missing?\n"
                             "3. Better query or next action: If another search is needed, give one improved search query. If no search is needed, say the best next action.\n\n"
                             "Requirements:\n"
@@ -213,130 +260,55 @@ class RewardManager():
                     
                     # Apply the chat template directly to token ids to avoid
                     # a second tokenizer pass introducing extra special tokens.
-                    hint_prompt_ids = self.tokenizer.apply_chat_template(
+                    teacher_prompt_ids = self.tokenizer.apply_chat_template(
                         messages,
                         tokenize=True,
                         add_generation_prompt=True
                     )
-                    hint_prompt = self.tokenizer.decode(hint_prompt_ids, skip_special_tokens=False)
+                    teacher_prompt = self.tokenizer.decode(teacher_prompt_ids, skip_special_tokens=False)
                     
-                    opsd_prompt_ids.append(torch.tensor(hint_prompt_ids, dtype=torch.long))
                     opsd_metadata.append({
                         'batch_idx': i,
                         'token_start_idx': token_start_idx,
                         'token_end_idx': token_end_idx,
+                        'clean_step_token_end_idx': clean_step_token_end_idx,
                         'action_token_start_idx': action_token_start_idx,
                         'action_token_end_idx': action_token_end_idx,
                         'action_type': action_type,
                         'history_str': history_text,
                         'current_state_str': current_state_str,
                         'action_str': action_str,
-                        'original_prefix_str': prefix_str,  # For KL input construction later
-                        'hint_prompt': hint_prompt,
+                        'step_text': step_text,
+                        'clean_step_text': clean_step_text,
+                        'original_prefix_str': clean_prefix_str,
+                        'teacher_prompt': teacher_prompt,
                     })
                     
                     if i == 0:  # Debug print for the first trajectory only
                         print(f"[OPSD DEBUG] Extracted Step in Traj 0 | Action: {action_type} | Token End Idx: {token_end_idx}")
-                        if len(opsd_prompt_ids) == 1:
-                            print(f"[OPSD DEBUG] Exact Prompt fed to Actor for Step 1:\n{hint_prompt}\n" + "-" * 50)
+                        if len(opsd_metadata) == 1:
+                            print(f"[OPSD DEBUG] Exact Teacher Prompt for Step 1:\n{teacher_prompt}\n" + "-" * 50)
 
-        # Process OPSD Dense Rewards if we have a rollout worker and extracted steps
-        if self.actor_rollout_wg is not None and opsd_prompt_ids:
-            print(f"\n[OPSD DEBUG] Total OPSD steps extracted across batch: {len(opsd_prompt_ids)}")
-            
-            # 1. Build a left-padded prompt batch.
-            # vLLM rollout strips left padding internally; right padding would leak pad tokens
-            # into prompt_token_ids and corrupt generation for shorter prompts.
-            pad_token_id = self.tokenizer.pad_token_id
-            max_prompt_len = max(seq.shape[0] for seq in opsd_prompt_ids)
-            batch_prompt_size = len(opsd_prompt_ids)
+        # Process OPSD Dense Rewards if we extracted steps. Teacher logits will
+        # be recomputed later under this prompt without an intermediate hint generation step.
+        if self.actor_rollout_wg is not None and opsd_metadata:
+            print(f"\n[OPSD DEBUG] Total OPSD steps extracted across batch: {len(opsd_metadata)}")
 
-            input_ids = torch.full((batch_prompt_size, max_prompt_len), pad_token_id, dtype=torch.long)
-            attention_mask = torch.zeros((batch_prompt_size, max_prompt_len), dtype=torch.long)
-            for idx, seq in enumerate(opsd_prompt_ids):
-                seq_len = seq.shape[0]
-                input_ids[idx, -seq_len:] = seq
-                attention_mask[idx, -seq_len:] = 1
-
-            position_ids = attention_mask.cumsum(dim=1) - 1
-            position_ids = position_ids.masked_fill(attention_mask == 0, 0)
-            
-            # 2. Batched Generation with GPU Padding
-            world_size = self.actor_rollout_wg.world_size
-            opsd_batch_size = len(opsd_prompt_ids)
-            remainder = opsd_batch_size % world_size
-            padding_size = 0
-            
-            if remainder != 0:
-                padding_size = world_size - remainder
-                # Pad by repeating the last item
-                pad_input_ids = input_ids[-1:].repeat(padding_size, *[1] * (len(input_ids.shape) - 1))
-                pad_attention_mask = attention_mask[-1:].repeat(padding_size, *[1] * (len(attention_mask.shape) - 1))
-                pad_position_ids = position_ids[-1:].repeat(padding_size, *[1] * (len(position_ids.shape) - 1))
-                
-                input_ids = torch.cat([input_ids, pad_input_ids], dim=0)
-                attention_mask = torch.cat([attention_mask, pad_attention_mask], dim=0)
-                position_ids = torch.cat([position_ids, pad_position_ids], dim=0)
-            
-            opsd_batch = DataProto.from_dict({
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'position_ids': position_ids
-            })
-            
-            opsd_batch.meta_info = {
-                'eos_token_id': self.tokenizer.eos_token_id,
-                'pad_token_id': self.tokenizer.pad_token_id,
-                'max_token_len': 128,
-                'max_tokens': 128,
-                'temperature': 0.0,
-                'top_p': 1.0,
-                'top_k': -1,
-                'n': 1,
-                'do_sample': False,
-                'recompute_log_prob': False,
-                'validate': True,
-                'use_dynamic_bsz': False,
-                'micro_batch_size': 128
-            }
-            
-            gen_output = self.actor_rollout_wg.generate_sequences(opsd_batch)
-            gen_responses = gen_output.batch['responses']
-            
-            # Remove padding
-            if padding_size > 0:
-                gen_responses = gen_responses[:-padding_size]
-                
-            gen_responses_str = self.tokenizer.batch_decode(gen_responses, skip_special_tokens=True)
-            
-            # 3. Parse and Store Hints (No Alpha)
-            hints = []
-            for idx, resp in enumerate(gen_responses_str):
-                hints.append(resp.strip())
-                
-                if opsd_metadata[idx]['batch_idx'] == 0:
-                    print(
-                        "[OPSD DEBUG] Traj 0 Prompt/Response Pair\n"
-                        f"[Prompt]\n{opsd_metadata[idx]['hint_prompt']}\n"
-                        f"[Response]\n{hints[-1]}\n"
-                        + "-" * 80
-                    )
-
-            # breakpoint()
-                
-            # 4. 1/N Distribution & Pack Hint Info for PPO Trainer
             batch_steps = defaultdict(list)
-            for meta, hint in zip(opsd_metadata, hints):
+            for meta in opsd_metadata:
                 batch_steps[meta['batch_idx']].append({
                     'token_start_idx': meta['token_start_idx'],
                     'token_end_idx': meta['token_end_idx'],
+                    'clean_step_token_end_idx': meta['clean_step_token_end_idx'],
                     'action_token_start_idx': meta['action_token_start_idx'],
                     'action_token_end_idx': meta['action_token_end_idx'],
-                    'hint': hint,
                     'history_str': meta['history_str'],
                     'current_state_str': meta['current_state_str'],
                     'action_str': meta['action_str'],
-                    'original_prefix_str': meta['original_prefix_str']
+                    'step_text': meta['step_text'],
+                    'clean_step_text': meta['clean_step_text'],
+                    'original_prefix_str': meta['original_prefix_str'],
+                    'teacher_prompt': meta['teacher_prompt'],
                 })
                 
             opsd_kl_data = np.empty((batch_size,), dtype=object)
