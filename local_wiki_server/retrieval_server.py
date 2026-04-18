@@ -213,46 +213,131 @@ class BM25Retriever(BaseRetriever):
             return results
 
 class DenseRetriever(BaseRetriever):
+    def _get_visible_gpu_count(self):
+        if hasattr(faiss, "get_num_gpus"):
+            try:
+                return faiss.get_num_gpus()
+            except Exception:
+                pass
+        return torch.cuda.device_count()
+
+    def _build_gpu_resources(self, num_gpus: int):
+        resources = [faiss.StandardGpuResources() for _ in range(num_gpus)]
+        for res in resources:
+            # Reserve scratch space to reduce temporary allocation failures.
+            res.setTempMemory(2 * 1024 * 1024 * 1024)
+            res.setDefaultNullStreamAllDevices()
+        return resources
+
+    def _build_single_gpu_flat_index(self, dim: int, metric_type, gpu_id: int):
+        gpu_index_config = faiss.GpuIndexFlatConfig()
+        gpu_index_config.useFloat16 = True
+        gpu_index_config.device = gpu_id
+
+        res = self.gpu_resources[gpu_id]
+        if metric_type == faiss.METRIC_INNER_PRODUCT:
+            return faiss.GpuIndexFlatIP(res, dim, gpu_index_config)
+        if metric_type == faiss.METRIC_L2:
+            return faiss.GpuIndexFlatL2(res, dim, gpu_index_config)
+        raise NotImplementedError(f"Unsupported flat metric type for manual sharding: {metric_type}")
+
+    def _clone_cpu_index_to_gpus(self, cpu_index, co, num_gpus: int):
+        if num_gpus > 1 and hasattr(faiss, "index_cpu_to_gpu_multiple_py"):
+            self.gpu_resources = self._build_gpu_resources(num_gpus)
+            gpu_ids = list(range(num_gpus))
+            try:
+                return faiss.index_cpu_to_gpu_multiple_py(
+                    self.gpu_resources, cpu_index, co=co, gpus=gpu_ids
+                )
+            except TypeError:
+                return faiss.index_cpu_to_gpu_multiple_py(
+                    self.gpu_resources, cpu_index, co=co
+                )
+
+        self.gpu_resources = self._build_gpu_resources(num_gpus)
+        try:
+            return faiss.index_cpu_to_all_gpus(cpu_index, ngpu=num_gpus, co=co)
+        except TypeError:
+            return faiss.index_cpu_to_all_gpus(cpu_index, co=co)
+
     def __init__(self, config):
         super().__init__(config)
         self.index = faiss.read_index(self.index_path)
         if config.faiss_gpu:
-            # Check if index is Flat, if so load in batches to avoid OOM
-            if isinstance(self.index, faiss.IndexFlat):
-                print(f"Loading {self.index.ntotal} vectors to GPU in batches...")
-                self.res = faiss.StandardGpuResources()
-                # Set temp memory to a larger value (2GB) to avoid memory management issues
-                # This helps prevent the 'p + size == head_' assertion failure
-                self.res.setTempMemory(2 * 1024 * 1024 * 1024)  # 2GB
-                # Use default stream to avoid concurrency issues
-                self.res.setDefaultNullStreamAllDevices()
-                
-                gpu_index_config = faiss.GpuIndexFlatConfig()
-                gpu_index_config.useFloat16 = True
-                gpu_index_config.device = 0
-                
-                if self.index.metric_type == faiss.METRIC_INNER_PRODUCT:
-                    gpu_index = faiss.GpuIndexFlatIP(self.res, self.index.d, gpu_index_config)
-                elif self.index.metric_type == faiss.METRIC_L2:
-                    gpu_index = faiss.GpuIndexFlatL2(self.res, self.index.d, gpu_index_config)
-                else:
-                    # Fallback
-                    co = faiss.GpuMultipleClonerOptions()
-                    co.useFloat16 = True
-                    co.shard = True
-                    gpu_index = faiss.index_cpu_to_all_gpus(self.index, co=co)
-                
-                if isinstance(gpu_index, (faiss.GpuIndexFlatIP, faiss.GpuIndexFlatL2)):
-                    batch_size = 500000
-                    for i in tqdm(range(0, self.index.ntotal, batch_size), desc="Transferring to GPU"):
-                        batch_vectors = self.index.reconstruct_n(i, min(batch_size, self.index.ntotal - i))
-                        gpu_index.add(batch_vectors)
-                    self.index = gpu_index
+            num_gpus = self._get_visible_gpu_count()
+            if num_gpus <= 0:
+                warnings.warn("faiss_gpu=True but no visible GPU found, falling back to CPU index.")
             else:
                 co = faiss.GpuMultipleClonerOptions()
                 co.useFloat16 = True
-                co.shard = True
-                self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
+                co.shard = num_gpus > 1
+
+            # Check if index is Flat, if so load in batches to avoid OOM
+                if isinstance(self.index, faiss.IndexFlat):
+                    cpu_index = self.index
+                    print(f"Loading {cpu_index.ntotal} vectors to {num_gpus} GPU(s) in batches...")
+
+                    if num_gpus == 1:
+                        if cpu_index.metric_type == faiss.METRIC_INNER_PRODUCT:
+                            empty_index = faiss.IndexFlatIP(cpu_index.d)
+                        elif cpu_index.metric_type == faiss.METRIC_L2:
+                            empty_index = faiss.IndexFlatL2(cpu_index.d)
+                        else:
+                            empty_index = faiss.IndexFlat(cpu_index.d, cpu_index.metric_type)
+
+                        gpu_index = self._clone_cpu_index_to_gpus(empty_index, co, num_gpus)
+                        batch_size = 500000
+                        for i in tqdm(range(0, cpu_index.ntotal, batch_size), desc="Transferring to GPU"):
+                            batch_vectors = cpu_index.reconstruct_n(
+                                i, min(batch_size, cpu_index.ntotal - i)
+                            )
+                            gpu_index.add(batch_vectors)
+                        self.index = gpu_index
+                    else:
+                        self.gpu_resources = self._build_gpu_resources(num_gpus)
+                        self.flat_gpu_shards = []
+                        gpu_index = faiss.IndexShards(cpu_index.d, True, True)
+
+                        shard_sizes = []
+                        base_shard_size = cpu_index.ntotal // num_gpus
+                        remainder = cpu_index.ntotal % num_gpus
+                        for gpu_id in range(num_gpus):
+                            shard_size = base_shard_size + (1 if gpu_id < remainder else 0)
+                            shard_sizes.append(shard_size)
+                            shard_index = self._build_single_gpu_flat_index(
+                                cpu_index.d, cpu_index.metric_type, gpu_id
+                            )
+                            gpu_index.add_shard(shard_index)
+                            self.flat_gpu_shards.append(shard_index)
+
+                        shard_offsets = [0]
+                        for shard_size in shard_sizes:
+                            shard_offsets.append(shard_offsets[-1] + shard_size)
+
+                        batch_size = 500000
+                        for i in tqdm(range(0, cpu_index.ntotal, batch_size), desc="Transferring to GPU"):
+                            batch_end = min(i + batch_size, cpu_index.ntotal)
+                            batch_vectors = cpu_index.reconstruct_n(i, batch_end - i)
+
+                            for shard_id in range(num_gpus):
+                                shard_start = shard_offsets[shard_id]
+                                shard_end = shard_offsets[shard_id + 1]
+                                overlap_start = max(i, shard_start)
+                                overlap_end = min(batch_end, shard_end)
+                                if overlap_start >= overlap_end:
+                                    continue
+
+                                local_start = overlap_start - i
+                                local_end = overlap_end - i
+                                self.flat_gpu_shards[shard_id].add(
+                                    batch_vectors[local_start:local_end]
+                                )
+
+                        if hasattr(gpu_index, "syncWithSubIndexes"):
+                            gpu_index.syncWithSubIndexes()
+                        self.index = gpu_index
+                else:
+                    self.index = self._clone_cpu_index_to_gpus(self.index, co, num_gpus)
 
         self.corpus = load_corpus(self.corpus_path)
         self.encoder = Encoder(

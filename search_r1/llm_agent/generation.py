@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass
 from .tensor_helper import TensorHelper, TensorConfig
 from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.utils.tracking import Tracking
 import shutil
 import requests
@@ -173,49 +174,16 @@ class LLMGenerationManager:
             if active_batch size is not divisible by num_gpus, pad with first sequence
             then remove padding from output
         """
-        num_gpus = self.config.num_gpus
-        if num_gpus <= 1:
+        world_size = getattr(self.actor_rollout_wg, 'world_size', self.config.num_gpus)
+        if world_size <= 1:
             return self.actor_rollout_wg.generate_sequences(active_batch)
-            
-        batch_size = active_batch.batch['input_ids'].shape[0]
-        remainder = batch_size % num_gpus
-        
+
         for key in active_batch.batch.keys():
             active_batch.batch[key] = active_batch.batch[key].long()
-        if remainder == 0:
-            return self.actor_rollout_wg.generate_sequences(active_batch)
-        
-        # Add padding sequences
-        padding_size = num_gpus - remainder
-        padded_batch = {}
-        
-        for k, v in active_batch.batch.items():
-            # Use first sequence as padding template
-            pad_sequence = v[0:1].repeat(padding_size, *[1] * (len(v.shape) - 1))
-            padded_batch[k] = torch.cat([v, pad_sequence], dim=0)
 
-        padded_active_batch = DataProto.from_dict(padded_batch)
-        for key in padded_active_batch.batch.keys():
-            padded_active_batch.batch[key] = padded_active_batch.batch[key].long()
-
-        # Generate with padded batch
+        padded_active_batch, pad_size = pad_dataproto_to_divisor(active_batch, world_size)
         padded_output = self.actor_rollout_wg.generate_sequences(padded_active_batch)
-
-        # Remove padding from output
-        trimmed_batch = {k: v[:-padding_size] for k, v in padded_output.batch.items()}
-        
-        # Handle meta_info if present
-        if hasattr(padded_output, 'meta_info') and padded_output.meta_info:
-            trimmed_meta = {}
-            for k, v in padded_output.meta_info.items():
-                if isinstance(v, torch.Tensor):
-                    trimmed_meta[k] = v[:-padding_size]
-                else:
-                    trimmed_meta[k] = v
-            padded_output.meta_info = trimmed_meta
-            
-        padded_output.batch = trimmed_batch
-        return padded_output
+        return unpad_dataproto(padded_output, pad_size=pad_size)
 
     def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor) -> Tuple[Dict, Dict]:
         """Run main LLM generation loop."""

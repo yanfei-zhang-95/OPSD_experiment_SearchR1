@@ -11,4 +11,4 @@
 #                                                     --retrieval_model_path $retriever_path \
 #                                                     --faiss_gpu True
 
-CUDA_VISIBLE_DEVICES=7 python retrieval_server.py
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python retrieval_server.py

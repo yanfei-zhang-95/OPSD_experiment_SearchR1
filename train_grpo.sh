@@ -17,16 +17,22 @@ WAND_PROJECT='Search-R1'
 # export BASE_MODEL='Qwen/Qwen3-4B'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-3b-em
 # export BASE_MODEL='Qwen/Qwen2.5-3B-Instruct'
-export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-3b-it-em
+# export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-3b-it-em
 # export BASE_MODEL='Qwen/Qwen2.5-7B'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-7b-em
 export BASE_MODEL='Qwen/Qwen2.5-7B-Instruct'
-export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-7b-it-em
+export EXPERIMENT_NAME=r1-searcher-r1-grpo-qwen2.5-7b-it-em
 
 # set -x
 export VLLM_ATTENTION_BACKEND=XFORMERS # vllm + qwen2-7b with flash_attn has some issues
 
 # max_prompt_length = (config['training']['max_start_length'] + config['training']['max_response_length'] * (config['training']['max_turns'] - 1) + config['training']['max_obs_length'] * config['training']['max_turns'])
+# Default OPSD / RLSD-style setting:
+#   +algorithm.opsd_student_scoring_mode=masked_prompt
+# Optional ablation:
+#   +algorithm.opsd_student_scoring_mode=rollout_old_log_prob
+# Optional OOM fallback:
+#   +actor_rollout_ref.rollout.opsd_logprob_chunk_size=16
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files=$DATA_DIR/train.parquet \
@@ -35,7 +41,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.val_data_num=null \
     data.train_batch_size=64 \
     data.val_batch_size=125 \
-    data.max_prompt_length=4096 \
+    data.max_prompt_length=8192 \
     data.max_response_length=2048 \
     data.max_start_length=2048 \
     data.max_obs_length=1024 \
@@ -61,6 +67,10 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     algorithm.no_think_rl=false \
+    +algorithm.opsd_student_scoring_mode=masked_prompt \
+    +algorithm.opsd_weight_clip=0.2 \
+    +algorithm.opsd_mix_lambda_init=0.5 \
+    +algorithm.opsd_mix_lambda_decay_steps=50 \
     actor_rollout_ref.rollout.n_agent=5 \
     actor_rollout_ref.rollout.temperature=1 \
     actor_rollout_ref.actor.state_masking=true \

@@ -50,7 +50,17 @@ def pad_dataproto_to_divisor(data: 'DataProto', size_divisor: int):
     assert isinstance(data, DataProto), 'data must be a DataProto'
     if len(data) % size_divisor != 0:
         pad_size = size_divisor - len(data) % size_divisor
-        data_padded = DataProto.concat([data, data[:pad_size]])
+        # NOTE: data[:pad_size] will be shorter than pad_size when len(data) < pad_size.
+        # This happens when the active batch is very small (e.g. 1~2 trajectories) but
+        # we still need to pad to world_size. In that case, repeat the batch until we
+        # have enough rows to slice.
+        assert len(data) > 0, 'cannot pad an empty DataProto'
+        if pad_size <= len(data):
+            pad_part = data[:pad_size]
+        else:
+            repeat = (pad_size + len(data) - 1) // len(data)
+            pad_part = DataProto.concat([data] * repeat)[:pad_size]
+        data_padded = DataProto.concat([data, pad_part])
     else:
         pad_size = 0
         data_padded = data

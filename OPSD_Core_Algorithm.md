@@ -1,324 +1,380 @@
-# OPSD (On-Policy Self-Distillation) 算法核心要点
+# OPSD / RLSD 风格蒸馏在 Search-R1 中的当前主线方案
 
-OPSD (On-Policy Self-Distillation) 是一种结合了强化学习（如 PPO/GRPO）与自我蒸馏机制的训练算法。在当前基于 `verl` 的 BrowseComp 实验中，OPSD 主要用于在多回合长轨迹（Trajectory）中提供细粒度的 Token 级别奖励和优势引导。
+本文档只保留当前已经确认的主线设计，不再保留已经被否定的旧方案，例如：
 
-以下是 OPSD 算法的核心要点与处理流：
+- `hint -> 再重算 step logits` 两层链路
+- `alpha` / 1/N step 均分逻辑
+- 只基于 `clean_history` 的无 observation 对照
+- `reward-based token shaping`
 
-## 0. 基础奖励计算与 ORM (Outcome Reward Model)
-- **概念**：在进行 OPSD Token 级别拆解前，首先需要从环境中获得轨迹级别的全局基础奖励 $R$（Macro Reward）。
-- **ORM 逻辑**：框架采用结果奖励模型（Outcome Reward Model，ORM）来评估整条轨迹的最终输出与真实标签（Ground Truth）的一致性。例如，在 BrowseComp 等任务中，通过提取模型给出的最终答案，并利用基准测试中的精确匹配（Exact Match）或子串匹配（Substring Match）规则进行判定。判定后得到的基础分数 $R$（通常为离散值如 $0$ 或 $1$）会作为后续所有步骤优势分配的总基数。
+当前认可的方向是：
 
-## 1. 轨迹步骤拆解 (Step Extraction)
-- **概念**：将 LLM 采样的完整长轨迹（包含多个回合的 `Thought`、`Action`、`Observation` 交互）拆解为离散的逻辑步骤单元。
-- **作用**：为后续的细粒度评估和提示生成提供基础评估单元，避免对整条长轨迹进行粗放式的打分。
+1. **Teacher / Student 都在完整状态（full state）条件下比较**
+2. **被优化的目标 span 只包含模型自己生成的 token**
+3. **Teacher 的特权信息来自 hindsight outcome information**
+4. **最终做的是 advantage-based shaping，而不是 reward-based shaping**
 
-## 2. LLM 提示生成 (Hint Generation)
-- **概念**：针对失败的轨迹或存在优化空间的特定步骤，调用强大的 LLM（或具有特权信息的 Teacher 模型）生成纠错提示（Hint）。在本框架中，默认采用 **Self-Distillation（自我蒸馏）** 模式，即直接使用当前正在训练的 Actor 权重进行本地推理生成 Hint。
-- **作用**：指出当前策略在某一步骤中的具体错误，并给出正确的思考方向或行动建议，为模型自我纠正提供监督信号。
-- **使用的 Prompt**：
-  ```text
-  You are generating a compact teacher hint for RL self-distillation.
-  Return a JSON object with keys hint and hint_reason.
+---
 
-  Question: {question}
-  History: {history_json}
-  Current state: {current_state}
-  Current action: {current_action}
-  Environment observation: {environment_observation}
-  ```
+## 0. 核心结论
 
-## 3. 教师评估与影响力打分 (Teacher Evaluation - $\alpha_i$ 计算)
-- **概念**：教师模型对拆解出的每一个步骤进行评估，计算每个步骤的重要性或影响力得分（通常记为 $\alpha_i$）。与 Hint 生成类似，本框架默认采用 Actor 权重进行本地自我评估。
-- **作用**：区分轨迹中关键的决策步和无关紧要的边缘步。得分 $\alpha_i$ 决定了该步骤在后续计算 Token 级别奖励时的权重，重点优化导致任务成功或失败的“关键帧”。
-- **算法公式**：
-  - 如果 **启用** $\alpha$ 评估：每个步骤的优势分配按照 $\alpha_i$ 占比分配基础奖励 $R$：
-    $$A_{step, i} = R \times \frac{\alpha_i}{\sum_{k=1}^{N} \alpha_k}$$
-  - 如果 **关闭** $\alpha$ 评估：基础奖励在所有步骤之间平均分配：
-    $$A_{step, i} = \frac{R}{N}$$
-    （其中 $N$ 为当前轨迹的总步骤数）
-- **使用的 Prompt**：
-  ```text
-  Evaluate the usefulness of the current reasoning step for solving the question.
-  Return a JSON object with a single key alpha in range [0, 2].
+Search-R1 当前最合理的蒸馏目标不是：
 
-  Question: {question}
-  History: {history_json}
-  Current step action: {current_action}
-  Current observation: {environment_observation}
-  ```
-
-## 4. KL 散度重加权 (KL Reweighting)
-- **概念**：在计算优势函数时，结合 KL 散度（即 Actor 模型与 Reference 模型的 Token 级别分布差异）进行重加权。在自我蒸馏中，这一步通过计算带有 Hint 的文本分布和原始状态分布之间的差异来实现。
-- **作用**：确保模型在学习 Teacher 的 Hint 和高分步骤时，不会偏离参考策略（Reference Policy）过远，从而保证 On-Policy 训练的稳定性和收敛性，防止模型崩溃。
-- **算法公式与 Token Reweighting 逻辑**：
-  1. 计算在特定上下文下生成第 $j$ 个 Token 的对数概率差异（即 KL 散度）：
-     $$KL_j = D_{KL} \left( \pi_{\text{student}}(\cdot | s_t) \parallel \pi_{\text{teacher}}(\cdot | s_t, \text{hint}) \right)[a_j]$$
-  2. 对整个步骤内生成的 Token 长度（记为 $L_i$），将 KL 散度进行归一化，得到每个 Token 的相对权重：
-     $$w_j = \frac{KL_j}{\sum_{k=1}^{L_i} KL_k}$$
-  3. 将之前计算得到的步骤级优势 $A_{step, i}$ 乘上 Token 权重，得到细粒度的 Token 优势：
-     $$A_{token, j} = A_{step, i} \times w_j$$
-- **具体的文本组装**：
-  - **Teacher Text (带 Hint 的输入)**：`{current_state}\n\nHint: {generated_hint}`
-  - **Student Text (原始输入)**：`{current_state}`
-  - **Answer Text (待测动作)**：`{current_action}`
-  （KL 引擎会对比模型在给定 Teacher Text 与 Student Text 下输出 Answer Text 时的 Token 级概率分布差异）
-
-## 5. 优势函数重塑 (Advantage Shaping)
-- **概念**：将环境反馈的基础稀疏奖励（如 GRPO 的任务最终成功与否）与 OPSD 计算出的 Token 级别奖励/步骤优势进行合并。
-- **作用**：将传统的稀疏奖励（Sequence-level Reward）转化为密集的 Token-level 奖励，使模型不仅知道“最终结果对不对”，还能明确知道“这中间每一步的思考过程到底好不好”。
-- **算法公式**：
-  最终分配到 Token 级别的奖励信号，由原始的 Macro Reward 和 OPSD Token Reward 按系数 $\lambda_{\text{ospd}}$ 进行组合（代码中实现为直接叠加至 `A_final` 以便于观察，在训练中则作为旁路密集奖励与主干 Actor Loss 合并）：
-  $$A_{\text{final}} = A_{\text{macro}} + \lambda_{\text{ospd}} \times \sum_{j} A_{token, j}$$
-  *(注：具体实现时 `A_token` 级别优势通过 `reward_extra_info` 透传回 PPO Trainer)*
-
-## 6. 在 verl 框架中的系统集成与实现架构 (最新)
-在本项目中，为了保持 `verl` 核心框架的纯洁性并最大化 GPU 利用率，OPSD 被设计为直接在 **Reward 计算阶段的内存拦截（In-memory Interception）** 模块：
-
-### 6.1 零侵入式模型注入 (Zero-Intrusion Injection)
-- **原理**：不修改 `verl` 内部的 `ray_trainer.py`，而是在用户层启动脚本（如 `main_ppo.py`）中，利用动态绑定将 `actor_rollout_wg`（即当前正在训练的 Actor 模型引擎）注入到 `RewardManager` 中。
-- **优势**：使得 `RewardManager` 获得了直接调用当前 Actor 模型进行推理（生成 Hint）和计算 Logits（计算 KL）的能力，同时完全解耦了算法层和框架层。
-
-### 6.2 内存就地批处理流 (In-memory Batched Processing)
-为了避免逐条处理导致的时间开销，以及避免将 Rollout 写入磁盘带来的 I/O 瓶颈，整个 OPSD 计算在 `RewardManager.__call__` 中以 Batched 形式在内存中瞬间完成：
-1. **收集与展平 (Flatten)**：在内存中解析当前 Batch 的完整轨迹字符串（`sequences_str`），利用正则表达式实时提取出所有的逻辑步骤（如 `<think>`, `<action>`），并记录它们在原 `response_ids` 序列中的 Token 索引起止位置。
-2. **组装 Hint/$\alpha$ 提示词**：为提取出的所有 Step 构造评估所需的 `opsd_prompt`。
-3. **一次性生成 (Batched Generation)**：将所有 Prompt 组装成一个扁平化的大 Batch，调用 `actor_rollout_wg.generate_sequences`，利用底层 vLLM/Megatron 引擎的并发能力实现极致吞吐，瞬间完成所有 Hint 和 $\alpha$ 打分的生成。
-4. **一次性计算 KL (Batched Forward)**：将 `[Teacher_Text + Answer]` 组成 Batch，调用 `actor_rollout_wg.compute_log_prob()` 拿到带 Hint 的教师 Logits，并完成 KL 散度加权。
-5. **映射回填 (Scatter)**：计算出所有 Token 的细粒度密集奖励（Dense Rewards）后，根据第 1 步记录的 Token 索引，将数据就地填回形状为 `[batch_size, response_length]` 的 `reward_tensor` 中，直接返回给 PPO/GRPO Trainer 进行优势计算。
-
-## 7. Search-R1 中的具体实现细节（Search-R1 OPSD Implementation）
-
-### 7.1 整体数据流概览
-
-Search-R1 的 OPSD 实现分布在两个核心文件中：
-
-| 文件 | 职责 |
-|------|------|
-| `verl/trainer/main_ppo.py`（`RewardManager` 类） | 轨迹拆解、Hint 生成、1/N 奖励分配、opsd_kl_data 构造 |
-| `verl/trainer/ppo/ray_trainer.py`（`_apply_opsd_token_level_kl` 方法） | Teacher Logits 计算、Token 级 KL 加权 |
-
-完整数据流如下：
-
-```
-Rollout Batch (sequences_str)
-    ↓
-RewardManager.__call__()
-    ├── 1. 正则拆解 <search>/<answer>/<information> 步骤
-    ├── 2. 构造 Hint 生成 Prompt（3-item 格式: Progress / Findings / Better query）
-    ├── 3. vLLM 批量生成 Hint
-    ├── 4. 1/N 等分 macro_reward → 每个 step 获得 dense_reward
-    ├── 5. 将 step_info (token_start/end, hint, current_state 等) 存入 opsd_kl_data
-    └── 6. 返回 reward_tensor（已在 step['token_end_idx'] 写入 dense_reward）
-    ↓
-ray_trainer.fit() 中:
-    reward_tensor = self.reward_fn(batch)
-    batch.batch['token_level_scores'] = reward_tensor
-    batch = self._apply_opsd_token_level_kl(batch)   ← 在这里完成 Token 级 KL
-    ↓
-apply_kl_penalty() / compute_advantage() / update_actor()
+```text
+teacher: p(clean_history | privileged_context)
+student: p(clean_history | normal_context)
 ```
 
-### 7.2 步骤拆解（Step Extraction）
+而是：
 
-采用正则表达式从 `sequences_str` 中提取步骤，匹配模式为：
+```text
+teacher: p(clear_step_text | masked_full_history, privileged_outcome_info)
+student: p(clear_step_text | original_rollout_context)
+```
+
+其中：
+
+- `clear_step_text`：当前要评估/蒸馏的模型生成片段
+- `masked_full_history`：在完整 history 中把这段 `clear_step_text` 挖空后的文本
+- `privileged_outcome_info`：训练时 hindsight 才知道的信息，如最终是否正确、最终答案、后续证据摘要
+
+这个设计的好处是：
+
+- **observation 仍然保留在条件上下文里**
+- **当前目标 span 不会直接泄露给 teacher**
+- **teacher 真正满足 `p(y|x,I)`，student 满足 `p(y|x)`**
+
+---
+
+## 1. 环境奖励与主干 RL 信号
+
+Search-R1 的主干训练仍然是 GRPO / PPO 风格：
+
+- 先由 ORM / EM 打分得到 trajectory-level reward
+- 再由 `compute_advantage()` 计算轨迹内 token advantage
+
+因此，主干 RL 的职责是：
+
+- 决定更新方向
+- 决定成功/失败的相对比较
+- 为失败样本提供负 advantage
+
+蒸馏分支不负责替代这件事，而是负责：
+
+- **在同一条轨迹内部，对 token update magnitude 进行更细粒度的重分配**
+
+---
+
+## 2. Full State 与 Learnable Span 的分离
+
+当前已经确认的关键原则是：
+
+### 2.1 Full State 仍然保留 observation
+
+在 Search-R1 中，一个 token 的合理性往往依赖 observation。
+
+因此，teacher / student 在重算 logprob 时，条件上下文不能只看去掉 `<information>` 后的文本，而应保留：
+
+- `Question`
+- 历史模型输出
+- 历史 observation
+- 当前 observation
+
+也就是说：
+
+```text
+observation 参与 delta 计算
+```
+
+### 2.2 但 observation token 本身不参与优化
+
+环境 observation 不是 actor 生成的，因此不应该被赋予 reward / advantage 或梯度。
+
+因此还需要一个单独的 **learnable token mask**：
+
+- `<think>...</think>`：可学习
+- `<search>...</search>`：可学习
+- `<answer>...</answer>`：可学习
+- `<information>...</information>`：不可学习
+
+也就是说：
+
+```text
+observation 参与判分，但不参与被更新
+```
+
+这是当前 agent 场景下最自然的 masking 方式。
+
+---
+
+## 3. 特权信息（Privileged Information）应当是什么
+
+在这个设定下，`observation` 本身**不是**特权信息，因为 student 在当前 state 里也能看到。
+
+真正的特权信息应当是：
+
+> **当前时刻看不到，但训练时回看整条轨迹后才能知道的 hindsight 信息**
+
+最自然的来源包括：
+
+- 这条轨迹最终是否正确
+- 最终答案是什么
+- 后续 observation 最终证实了什么
+- 当前前缀后来是被验证为有效、无效还是误导
+
+因此，当前最合理的 PI 定义是：
+
+```text
+privileged_outcome_info = hindsight outcome information
+```
+
+它不是当前 state 的一部分，但训练时合法可得。
+
+---
+
+## 4. Masked Full History 方案
+
+### 4.1 基本思想
+
+对于当前要蒸馏的一段 `clear_step_text`：
+
+1. 在完整 history 中把这一段挖空
+2. 保留其余完整上下文
+3. 在 teacher 侧追加 hindsight outcome information
+4. 用 teacher / student 分别对这段被挖空的 `clear_step_text` 算 logprob
+
+记号上：
+
+- `y = clear_step_text`
+- `x = masked_full_history`
+- `I = privileged_outcome_info`
+
+则：
+
+```text
+teacher: p(y | x, I)
+student: p(y | x)
+```
+
+这就是当前最接近标准 teacher/student distillation 的形式。
+
+### 4.2 为什么比 clean history 更好
+
+它同时解决了三个问题：
+
+1. **保留真实 state 条件**
+   - observation 仍然参与 token 合理性的判断
+
+2. **避免 target leakage**
+   - 当前要预测的 span 被挖空，不会直接塞进 teacher prompt
+
+3. **PI 真正额外**
+   - teacher 多看到的是 hindsight outcome info，而不是 student 本来就能看到的 state
+
+---
+
+## 5. 对 `answer` step 的特殊处理
+
+若当前被挖空的是最终 `<answer>` span，那么把“最终答案原文”直接放进特权信息里会导致强 target leakage。
+
+因此建议分情况：
+
+### 对 `search` / `think` step
+
+可以给 teacher：
+
+- 是否最终成功
+- 最终答案
+- 后续关键证据摘要
+
+### 对 `answer` step
+
+不要直接给最终答案原文，建议只给：
+
+- 是否最终正确
+- 哪些证据支持正确答案
+- 当前答案是否应与某些 observation 一致
+
+这样可以减少 oracle 泄露。
+
+---
+
+## 6. Delta 计算与 Masking
+
+### 6.1 Delta 的定义
+
+对于目标 span 中第 $t$ 个 token：
+
+$$
+\Delta_t = \ell_t^{(T)} - \ell_t^{(S)}
+$$
+
+其中：
+
+- $\ell_t^{(T)} = \log p_{	ext{teacher}}(y_t \mid x, I)$
+- $\ell_t^{(S)} = \log p_{	ext{student}}(y_t \mid x)$
+
+### 6.2 Masking 原则
+
+虽然 teacher / student 的条件上下文保留完整 state，但做 token reweighting 时，应只在可学习 token 上归一化：
 
 ```python
-pattern = rf'<({action_types})>([^<]+)</({action_types})>|(<think>[^<]*</think>)'
+masked_delta = delta.masked_fill(learnable_token_mask == 0, -1e9)
+weights = torch.softmax(masked_delta, dim=-1)
+weights = weights * learnable_token_mask
+weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 ```
 
-每提取到一个步骤，记录以下关键信息：
+这意味着：
 
-| 字段 | 含义 |
-|------|------|
-| `token_start_idx` | 该步骤在 `response_ids` 中的起始 token 位置 |
-| `token_end_idx` | 该步骤在 `response_ids` 中的结束 token 位置 |
-| `action_token_start_idx` | `<action>` 标签**后**内容开始的 token 位置 |
-| `action_token_end_idx` | `</action>` 标签**前**内容结束的 token 位置 |
-| `action_type` | 动作类型：`search`、`answer` 或 `information` |
-| `history_str` | 到当前步骤为止的完整历史轨迹文本 |
-| `current_state_str` | 恰好在当前步骤**之前**的轨迹文本（即 Teacher 的条件上下文） |
-| `original_prefix_str` | 同 `current_state_str`，用于后续 KL 计算时还原学生分布 |
-| `hint_prompt` | 用于 Debug 打印的完整 Hint 生成 Prompt |
+- observation token 不参与权重竞争
+- softmax 只在模型自己生成的 span 上归一化
 
-### 7.3 Hint 生成 Prompt（3-Item 结构）
+---
 
-不同于传统的 JSON 结构化输出，Search-R1 采用纯文本的 3-item Hint 格式：
+## 7. Advantage-Based Shaping
 
-```
-You are a careful teacher for RL self-distillation...
-Output exactly 3 numbered items in plain text:
-1. Progress: Is this step better, worse, or neutral for solving the question so far? Give a short reason.
-2. Findings: What did this step successfully find, and what important information is still missing?
-3. Better query or next action: If another search is needed, give one improved search query...
+当前已经确认的关键修正是：
 
-Requirements:
-- Focus on step quality, not style.
-- If the current step is based on a wrong assumption, say so explicitly.
-- If the current answer conflicts with the observation, say so explicitly.
-- If the current search query is weak, ambiguous, or too broad, propose a sharper query.
-- Keep each item short and specific.
-```
+> **OPSD 在这个项目里应当作用在 advantage 上，而不是直接作用在 reward 上。**
 
-其中 `current_state_str` 和 `history_str` 分别注入到 Prompt 的对应位置：
+原因是：
+
+- 如果直接做 `reward-based shaping`
+- 那么 `reward=0` 的样本即使算了 `weights`，最终也仍然是 0
+
+因此，当前主线应当是：
+
+$$
+\widetilde{A}_t = A_t \cdot w_t
+$$
+
+其中：
+
+- $A_t$：主干 RL 算出来的 token advantage
+- $w_t$：teacher/student delta 导出的 token weight
+
+代码层面的抽象是：
 
 ```python
-messages = [
-    {"role": "system", "content": "You are a careful teacher for RL self-distillation..."},
-    {"role": "user", "content": (
-        f"Question: {question_text}\n"
-        f"History so far: {history_text}\n"
-        f"Current step action: <{action_type}>{action_content}</{action_type}>\n"
-        f"Current observation: {obs_content[:1000]}\n\n"
-        "Evaluate ONLY the current step based on the history so far.\n"
-        "Output exactly 3 numbered items..."
-    )}
-]
+shaped_advantages = advantages * opsd_token_weights
 ```
 
-Tokenize 时使用 `apply_chat_template(..., tokenize=True, add_generation_prompt=True)`，确保只经过一次 chat template 处理，避免双重 special token 化。
+所以现在：
 
-### 7.4 奖励分配（1/N 均分 + opsd_kl_data）
+- 主干 RL 决定更新方向
+- OPSD 决定轨迹内部 token 更新的相对幅度
+
+这与 RLSD 的思想是一致的：
+
+```text
+direction <- RL / advantage
+magnitude <- self-distillation token difference
+```
+
+---
+
+## 8. Clipping 的标准位置
+
+当前已经确认：
+
+- 不再对 `delta` 做 clipping
+- clipping 应放在最终进入 actor update 的逐 token optimization signal 上
+
+因此更标准的位置是：
 
 ```python
-opsd_kl_data = np.empty((batch_size,), dtype=object)
-for i in range(batch_size):
-    macro_score = all_scores[i]          # ORM 最终分数（0 或 1）
-    step_info = batch_steps.get(i, [])    # 该轨迹所有步骤的元信息
-    
-    opsd_kl_data[i] = step_info           # 保存，供后续 _apply_opsd_token_level_kl 使用
-    
-    if not step_info:
-        reward_tensor[i, valid_response_lengths[i] - 1] = macro_score  # 兜底稀疏奖励
-        continue
-        
-    num_steps = len(step_info)
-    dense_reward = macro_score / num_steps  # 1/N 等分
-    
-    for step in step_info:
-        reward_tensor[i, step['token_end_idx']] = dense_reward
+shaped_advantages = advantages * opsd_token_weights
+shaped_advantages = shaped_advantages * rescale
+shaped_advantages = shaped_advantages.clamp(min=-opsd_advantage_clip, max=opsd_advantage_clip)
 ```
 
-注入 `opsd_kl_data` 到 DataProto 的 `non_tensor_batch` 中：
+这里被裁的是：
 
-```python
-data.non_tensor_batch['opsd_kl_data'] = opsd_kl_data
-```
+$$
+\widetilde{A}_t
+$$
 
-### 7.5 Teacher Logits 计算（_apply_opsd_token_level_kl）
+而不是中间分数：
 
-该方法在 `ray_trainer.fit()` 的主循环中被调用，**位于 `reward_fn` 返回 reward_tensor 之后**，核心步骤如下：
+$$
+\Delta_t
+$$
 
-#### 7.5.1 Teacher Prompt 构造
+这比 `delta.clamp()` 更接近标准的 per-token clipping 思路，因为它直接控制最终逐 token 更新强度。
 
-对每个 step，Teacher 的输入文本为：
+---
 
-```
-teacher_prompt = current_state + "\n\nHint: " + hint
-```
+## 9. 当前 Search-R1 的实施状态
 
-其中 `current_state` 是当前步骤之前的历史文本（不含当前步骤本身），`hint` 是 Teacher 模型生成的改进建议。
+### 已经开始实施
 
-#### 7.5.2 Left-Padded Logprob Batch 构造
+- `reward-based shaping -> advantage-based shaping`
+- `opsd_token_weights` 缓存到 batch
+- `compute_advantage()` 后对 `advantages` 做 token 级重分配
+- 对最终 `shaped_advantages` 做 clipping
 
-由于 `compute_log_prob()` 需要对 prompt 和 response 分别编码，采用左填充（Left-Padding）避免右填充带来的 pad token 泄露问题：
+### 尚未完全落地
 
-```python
-def _build_left_padded_logprob_batch(self, prompt_ids_list, response_ids_list, micro_batch_size=128):
-    pad_token_id = self.tokenizer.pad_token_id
-    max_prompt_len = max(x.numel() for x in prompt_ids_list)
-    max_resp_len = max(x.numel() for x in response_ids_list)
-    seq_len = max_prompt_len + max_resp_len
-    
-    input_ids = torch.full((batch_size, seq_len), pad_token_id, dtype=torch.long)
-    attention_mask = torch.zeros((batch_size, seq_len), dtype=torch.long)
-    responses = torch.full((batch_size, max_resp_len), pad_token_id, dtype=torch.long)
-    
-    for i, (prompt_ids, response_ids) in enumerate(zip(prompt_ids_list, response_ids_list)):
-        # 左填充：内容靠右对齐
-        input_ids[i, max_prompt_len - p_len:max_prompt_len] = prompt_ids
-        input_ids[i, max_prompt_len:max_prompt_len + r_len] = response_ids
-        attention_mask[i, max_prompt_len - p_len:max_prompt_len + r_len] = 1
-        responses[i, :r_len] = response_ids
-    
-    position_ids = attention_mask.cumsum(dim=1) - 1
-    position_ids = position_ids.masked_fill(attention_mask == 0, 0)
-```
+- `teacher: p(y|x,I), student: p(y|x)` 的 **masked full history + outcome PI** 输入构造
+- 显式的 `learnable_token_mask`
+- 在 delta softmax 归一化中排除 observation token
+- `answer` step 的 anti-leakage 特殊处理
 
-#### 7.5.3 DataProto Padding（World_Size Divisibility）
+也就是说：
 
-`compute_log_prob()` 要求 DataProto 大小能被 `world_size=8` 整除，因此使用已有的 padding 工具：
+- **advantage-based shaping 主线已经开始实施**
+- **teacher/student 的特权输入设计还需要进一步改到 masked full history 版本**
 
-```python
-teacher_batch_padded, pad_size = pad_dataproto_to_divisor(
-    teacher_batch, self.actor_rollout_wg.world_size
-)
-teacher_logprob_output_padded = self.actor_rollout_wg.compute_log_prob(teacher_batch_padded)
-teacher_logprob_output = unpad_dataproto(teacher_logprob_output_padded, pad_size=pad_size)
-teacher_log_probs = teacher_logprob_output.batch['old_log_probs']
-```
+---
 
-#### 7.5.4 Token 级 KL 重加权（Softmax Smoothing）
+## 10. 最终主线总结
 
-对每个 step，对比 Teacher 和 Student 在该 step 对应 action token span 上的 log probabilities：
+当前最合理、且后续应继续推进的版本可以概括为：
 
-```python
-delta = teacher_lp - student_lp          # shape: [shared_len]
-weights = torch.softmax(delta, dim=-1)   # 平滑权重，避免 one-hot collapse
+1. **主干 RL**  
+   用 ORM / EM + GRPO 计算 reward 与 advantage
 
-step_reward = macro_reward / num_steps   # 1/N dense reward
-token_level_scores[batch_idx, action_start:action_start + shared_len] = step_reward * weights
-```
+2. **Teacher / Student 条件分布**  
+   用完整 state 做条件，不删除 observation
 
-**关键澄清**：`teacher_lp` 和 `student_lp` 本身是**原始 log probabilities**（未经 ReLU/截断），它们来自：
-- `student_lp`：Rollout 时原始策略在 `current_state` 条件下采样 `action_str` 的 log prob（来自 `batch.old_log_probs`）
-- `teacher_lp`：`compute_log_prob()` 在 `current_state + "\n\nHint: " + hint` 条件下计算 `action_str` 的 log prob
+3. **Target Span**  
+   只预测并更新当前被挖空的 `clear_step_text`
 
-**Softmax vs ReLU**：之前尝试用 `relu(delta)` 发现权重会退化为 one-hot（最大 delta 独占全部权重），改为 `softmax(delta, dim=-1)` 后权重分布更加平滑，避免对单个 token 的过度聚焦。
+4. **Privileged Information**  
+   使用 hindsight outcome information，而不是当前 state 自带信息
 
-### 7.6 调试打印（Debug Prints）
+5. **Masking**  
+   observation 参与条件判断，但不参与 token update
 
-实现了两层 Debug 打印，分别在 Hint 生成阶段和 Token 级 KL 计算阶段：
+6. **Shaping**  
+   对 `advantages` 做 token 级重分配，而不是对 `reward` 做重分配
 
-**Hint 生成阶段（main_ppo.py）**：
-```python
-if opsd_metadata[idx]['batch_idx'] == 0:
-    print(
-        "[OPSD DEBUG] Traj 0 Prompt/Response Pair\n"
-        f"[Prompt]\n{opsd_metadata[idx]['hint_prompt']}\n"
-        f"[Response]\n{hints[-1]}\n"
-        + "-" * 80
-    )
-```
+7. **Clipping**  
+   对最终 `shaped_advantages` 做 clipping，而不是对 `delta` 做 clipping
 
-**Token 级 KL 阶段（ray_trainer.py）**：
-```python
-if batch_idx == 0 and meta['step_idx'] < 3:
-    print(
-        "[OPSD KL DEBUG] Token-Level KL\n"
-        f"[Step Idx] {meta['step_idx']}\n"
-        f"[Action Text]\n{action_text}\n"
-        f"[Student LogProb] {student_lp.tolist()}\n"
-        f"[Teacher LogProb] {teacher_lp.tolist()}\n"
-        f"[Delta] {delta.tolist()}\n"
-        f"[Weights] {weights.tolist()}\n"
-        f"[Macro Reward] {float(macro_reward):.6f}\n"
-        f"[Step Reward] {float(step_reward):.6f}\n"
-        + "-" * 80
-    )
-```
+这条主线的数学形式是：
 
-### 7.7 在 verl fit() 循环中的调用位置
+$$
+	ext{teacher: } p(y \mid x, I), \qquad
+	ext{student: } p(y \mid x)
+$$
 
-```python
-# verl/trainer/ppo/ray_trainer.py fit() 方法，约第 972 行
-reward_tensor = self.reward_fn(batch)
-batch.batch['token_level_scores'] = reward_tensor
-batch = self._apply_opsd_token_level_kl(batch)   # ← OPSD Token KL 在此处注入
+$$
+\Delta_t = \log p_{	ext{teacher}}(y_t) - \log p_{	ext{student}}(y_t)
+$$
 
-# compute rewards. apply_kl_penalty if available
-if not self.config.actor_rollout_ref.actor.use_kl_loss:
-    batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl, kl_penalty=self.config.algorithm.kl_penalty)
-    metrics.update(kl_metrics)
-else:
-    batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
-```
+$$
+w_t = 	ext{softmax}(\Delta)_t \quad 	ext{(仅在可学习 token 上归一化)}
+$$
+
+$$
+\widetilde{A}_t = A_t \cdot w_t
+$$
+
+最终由：
+
+- 主干 advantage 决定方向
+- teacher-conditioned token weights 决定轨迹内部更新分布
+
+这就是当前 Search-R1 中最合理的 OPSD / RLSD 风格实现方向。

@@ -89,6 +89,98 @@ class RewardManager():
     def _remove_information_block(self, text: str) -> str:
         return self.information_pattern.sub("", text)
 
+    def _format_ground_truth_answer(self, ground_truth) -> str:
+        if isinstance(ground_truth, dict):
+            target = ground_truth.get('target', ground_truth)
+        else:
+            target = ground_truth
+
+        if isinstance(target, (list, tuple)):
+            target = " | ".join(str(x) for x in target)
+        elif not isinstance(target, str):
+            target = str(target)
+
+        return self._truncate_by_tokens(target, max_tokens=128)
+
+    def _score_to_correctness_label(self, score) -> str:
+        try:
+            return "correct" if float(score) == 1.0 else "incorrect_or_other"
+        except Exception:
+            return "incorrect_or_other"
+
+    def _build_masked_history_for_step(self, response_str: str, step_start_char_idx: int, step_end_char_idx: int) -> str:
+        step_text = response_str[step_start_char_idx:step_end_char_idx]
+        obs_match = self.information_pattern.search(step_text)
+
+        if obs_match is None:
+            masked_step_text = "[MASKED_CURRENT_STEP]"
+        else:
+            observation_block = step_text[obs_match.start():obs_match.end()]
+            masked_step_text = "[MASKED_CURRENT_STEP]\n" + observation_block
+
+        return response_str[:step_start_char_idx] + masked_step_text + response_str[step_end_char_idx:]
+
+    def _build_opsd_prompts(self,
+                            question_text: str,
+                            masked_history_for_step: str,
+                            action_type: str,
+                            correctness_label: str,
+                            ground_truth_answer: str):
+        truncated_history = self._truncate_by_tokens(masked_history_for_step, max_tokens=1536)
+
+        student_messages = [
+            {"role": "system", "content": (
+                "You are predicting the current step text for a trajectory. "
+                "Use the provided context to score the current step continuation. "
+                "Output only the current step text."
+            )},
+            {"role": "user", "content": (
+                f"Question: {question_text}\n\n"
+                f"Trajectory with the current step masked:\n{truncated_history}\n\n"
+                "Predict the current step text that should continue from this masked trajectory context. "
+                "Output only the current step text."
+            )}
+        ]
+
+        if action_type == 'answer':
+            outcome_info = f"Final correctness: {correctness_label}"
+        else:
+            outcome_info = (
+                f"Final correctness: {correctness_label}\n"
+                f"Reference answer: {ground_truth_answer}"
+            )
+
+        teacher_messages = [
+            {"role": "system", "content": (
+                "You are a privileged teacher for step-wise RL self-distillation. "
+                "Use the same masked trajectory context as the student, plus hindsight outcome information, "
+                "to score the current step continuation. "
+                "Output only the current step text."
+            )},
+            {"role": "user", "content": (
+                f"Question: {question_text}\n\n"
+                f"Trajectory with the current step masked:\n{truncated_history}\n\n"
+                f"Hindsight outcome information:\n{outcome_info}\n\n"
+                "Predict the current step text that should continue from this masked trajectory context. "
+                "Output only the current step text."
+            )}
+        ]
+
+        student_prompt_ids = self.tokenizer.apply_chat_template(
+            student_messages,
+            tokenize=True,
+            add_generation_prompt=True
+        )
+        teacher_prompt_ids = self.tokenizer.apply_chat_template(
+            teacher_messages,
+            tokenize=True,
+            add_generation_prompt=True
+        )
+
+        student_prompt = self.tokenizer.decode(student_prompt_ids, skip_special_tokens=False)
+        teacher_prompt = self.tokenizer.decode(teacher_prompt_ids, skip_special_tokens=False)
+        return student_prompt, teacher_prompt
+
     def _split_response_into_steps(self, response_str: str):
         """Split a trajectory by </information> and keep the final tail step."""
         steps = []
@@ -188,18 +280,28 @@ class RewardManager():
                     action_type = action_match.group(1)
                     action_content = action_match.group(2)
                     obs_match = self.information_pattern.search(step_text)
-                    obs_content = obs_match.group(1) if obs_match else ""
                     clean_step_end_char_idx = end_char_idx
                     if obs_match is not None:
                         clean_step_end_char_idx = step_start_char_idx + obs_match.start()
 
-                    history_str = response_str[:step_start_char_idx]
-                    history_text = self._strip_information_tags(history_str)
                     prefix_str = response_str[:end_char_idx]
                     clean_prefix_str = self._strip_information_tags(prefix_str)
                     question_text = self._extract_question_text(data_item, prompt_str)
                     action_str = f"<{action_type}>{action_content}</{action_type}>"
-                    current_state_str = history_text
+                    masked_history_for_step = self._build_masked_history_for_step(
+                        response_str=response_str,
+                        step_start_char_idx=step_start_char_idx,
+                        step_end_char_idx=end_char_idx,
+                    )
+                    correctness_label = self._score_to_correctness_label(score)
+                    ground_truth_answer = self._format_ground_truth_answer(ground_truth)
+                    student_prompt, teacher_prompt = self._build_opsd_prompts(
+                        question_text=question_text,
+                        masked_history_for_step=masked_history_for_step,
+                        action_type=action_type,
+                        correctness_label=correctness_label,
+                        ground_truth_answer=ground_truth_answer,
+                    )
                     
                     # Approximate token index by tokenizing the prefix
                     start_prefix_tokens = self.tokenizer.encode(response_str[:step_start_char_idx], add_special_tokens=False)
@@ -230,43 +332,6 @@ class RewardManager():
                     action_token_start_idx = max(0, min(action_token_start_idx, valid_response_length.item() - 1))
                     action_token_end_idx = max(0, min(action_token_end_idx, valid_response_length.item() - 1))
                     
-                    # Construct Hint Generation prompt with trajectory history.
-                    messages = [
-                        {"role": "system", "content": (
-                            "You are a careful teacher for RL self-distillation. "
-                            "Evaluate the current step relative to the trajectory so far. "
-                            "Be concise, concrete, and action-oriented."
-                        )},
-                        {"role": "user", "content": (
-                            f"Question: {question_text}\n"
-                            f"History so far: {history_text}\n"
-                            f"Current step text:\n{clean_step_text}\n"
-                            f"Current observation: {obs_content[:1000]}\n\n"
-                            "Evaluate ONLY the current step based on the history so far.\n"
-                            "Output exactly 3 numbered items in plain text:\n"
-                            "1. Progress: Given further observations, is this step better, worse, or neutral for solving the question so far? Give a short reason.\n"
-                            "2. Findings: What did this step successfully find, and what important information is still missing?\n"
-                            "3. Better query or next action: If another search is needed, give one improved search query. If no search is needed, say the best next action.\n\n"
-                            "Requirements:\n"
-                            "- Focus on step quality, not style.\n"
-                            "- If the current step is based on a wrong assumption, say so explicitly.\n"
-                            "- If the current answer conflicts with the observation, say so explicitly.\n"
-                            "- If the current search query is weak, ambiguous, or too broad, propose a sharper query.\n"
-                            "- Keep each item short and specific."
-                        )}
-                    ]
-
-                    # breakpoint()
-                    
-                    # Apply the chat template directly to token ids to avoid
-                    # a second tokenizer pass introducing extra special tokens.
-                    teacher_prompt_ids = self.tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=True,
-                        add_generation_prompt=True
-                    )
-                    teacher_prompt = self.tokenizer.decode(teacher_prompt_ids, skip_special_tokens=False)
-                    
                     opsd_metadata.append({
                         'batch_idx': i,
                         'token_start_idx': token_start_idx,
@@ -275,18 +340,20 @@ class RewardManager():
                         'action_token_start_idx': action_token_start_idx,
                         'action_token_end_idx': action_token_end_idx,
                         'action_type': action_type,
-                        'history_str': history_text,
-                        'current_state_str': current_state_str,
+                        'masked_history_for_step': masked_history_for_step,
+                        'correctness_label': correctness_label,
                         'action_str': action_str,
                         'step_text': step_text,
                         'clean_step_text': clean_step_text,
                         'original_prefix_str': clean_prefix_str,
+                        'student_prompt': student_prompt,
                         'teacher_prompt': teacher_prompt,
                     })
                     
                     if i == 0:  # Debug print for the first trajectory only
                         print(f"[OPSD DEBUG] Extracted Step in Traj 0 | Action: {action_type} | Token End Idx: {token_end_idx}")
                         if len(opsd_metadata) == 1:
+                            print(f"[OPSD DEBUG] Exact Student Prompt for Step 1:\n{student_prompt}\n" + "-" * 50)
                             print(f"[OPSD DEBUG] Exact Teacher Prompt for Step 1:\n{teacher_prompt}\n" + "-" * 50)
 
         # Process OPSD Dense Rewards if we extracted steps. Teacher logits will
@@ -302,12 +369,14 @@ class RewardManager():
                     'clean_step_token_end_idx': meta['clean_step_token_end_idx'],
                     'action_token_start_idx': meta['action_token_start_idx'],
                     'action_token_end_idx': meta['action_token_end_idx'],
-                    'history_str': meta['history_str'],
-                    'current_state_str': meta['current_state_str'],
+                    'masked_history_for_step': meta['masked_history_for_step'],
+                    'correctness_label': meta['correctness_label'],
                     'action_str': meta['action_str'],
+                    'action_type': meta['action_type'],
                     'step_text': meta['step_text'],
                     'clean_step_text': meta['clean_step_text'],
                     'original_prefix_str': meta['original_prefix_str'],
+                    'student_prompt': meta['student_prompt'],
                     'teacher_prompt': meta['teacher_prompt'],
                 })
                 
@@ -318,22 +387,9 @@ class RewardManager():
                 step_info = batch_steps.get(i, [])
                 
                 opsd_kl_data[i] = step_info  # Save for KL in ray_trainer.py
-                
-                if not step_info:
-                    # Fallback to sparse if no steps extracted
-                    reward_tensor[i, valid_response_lengths[i] - 1] = macro_score
-                    if i == 0: print(f"[OPSD DEBUG] Traj 0 | No steps extracted. Assigned sparse reward: {macro_score}")
-                    continue
-                    
-                # 1/N Equal Distribution
-                num_steps = len(step_info)
-                dense_reward = macro_score / num_steps
-                
-                if i == 0: print(f"[OPSD DEBUG] Traj 0 | Macro Reward: {macro_score} | Distributed 1/{num_steps} = {dense_reward:.4f} to each step")
-                
-                for step in step_info:
-                    reward_tensor[i, step['token_end_idx']] = dense_reward
-                    if i == 0: print(f"[OPSD DEBUG] Traj 0 | Assign Dense Reward {dense_reward:.4f} at Token Idx {step['token_end_idx']}")
+                reward_tensor[i, valid_response_lengths[i] - 1] = macro_score
+                if i == 0:
+                    print(f"[OPSD DEBUG] Traj 0 | Macro Reward: {macro_score} | Assigned sparse reward at final token")
                     
             # Inject OPSD data back into the batch for KL computation
             data.non_tensor_batch['opsd_kl_data'] = opsd_kl_data

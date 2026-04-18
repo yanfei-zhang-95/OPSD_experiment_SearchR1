@@ -24,10 +24,6 @@ from enum import Enum
 from pprint import pprint
 from typing import Type, Dict
 
-import re
-import json
-from collections import defaultdict
-
 import numpy as np
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
@@ -39,7 +35,6 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
-import re
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
 
 WorkerType = Type[Worker]
@@ -121,6 +116,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+    _ = num_repeat
     # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == 'gae':
@@ -151,6 +147,28 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch['returns'] = returns
     else:
         raise NotImplementedError
+
+    opsd_token_delta = data.batch.get('opsd_token_delta', None)
+    if opsd_token_delta is not None:
+        advantages = data.batch['advantages']
+        response_length = data.batch['responses'].size(-1)
+        response_mask = data.batch['attention_mask'][:, -response_length:].float()
+
+        opsd_weight_clip = float(data.meta_info.get('opsd_weight_clip', 0.2))
+        opsd_mix_lambda = float(data.meta_info.get('opsd_mix_lambda', 0.0))
+
+        signed_delta = torch.sign(advantages) * opsd_token_delta.detach()
+        opsd_raw_weights = torch.exp(signed_delta)
+        opsd_clipped_weights = opsd_raw_weights.clamp(
+            min=1.0 - opsd_weight_clip,
+            max=1.0 + opsd_weight_clip,
+        )
+        opsd_multipliers = (1.0 - opsd_mix_lambda) + opsd_mix_lambda * opsd_clipped_weights
+        shaped_advantages = advantages * opsd_multipliers
+        shaped_advantages = shaped_advantages * response_mask
+
+        data.batch['opsd_token_weights'] = opsd_clipped_weights * response_mask
+        data.batch['advantages'] = shaped_advantages
     return data
 
 
@@ -478,9 +496,23 @@ class RayPPOTrainer(object):
         if opsd_kl_data is None or len(opsd_kl_data) == 0:
             return batch
 
-        teacher_prompt_ids = []
-        teacher_response_ids = []
-        teacher_meta = []
+        logprob_micro_batch_size = self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size
+        try:
+            opsd_logprob_chunk_size = int(self.config.actor_rollout_ref.rollout.opsd_logprob_chunk_size)
+        except Exception:
+            opsd_logprob_chunk_size = min(32, int(logprob_micro_batch_size))
+        opsd_logprob_chunk_size = max(1, opsd_logprob_chunk_size)
+        try:
+            opsd_student_scoring_mode = str(self.config.algorithm.opsd_student_scoring_mode)
+        except Exception:
+            opsd_student_scoring_mode = 'masked_prompt'
+        if opsd_student_scoring_mode not in ('masked_prompt', 'rollout_old_log_prob'):
+            raise ValueError(
+                f"Unsupported algorithm.opsd_student_scoring_mode={opsd_student_scoring_mode}. "
+                "Expected 'masked_prompt' or 'rollout_old_log_prob'."
+            )
+
+        step_records = []
         debug_examples = []
 
         for batch_idx in range(len(batch)):
@@ -488,12 +520,21 @@ class RayPPOTrainer(object):
             if step_list is None:
                 continue
             for step_idx, step in enumerate(step_list):
+                student_prompt = step.get('student_prompt', '')
                 teacher_prompt = step.get('teacher_prompt', '')
                 clean_step_text = step.get('clean_step_text', '')
                 if not teacher_prompt or not clean_step_text:
                     continue
+                if opsd_student_scoring_mode == 'masked_prompt' and not student_prompt:
+                    continue
 
-                prompt_ids = torch.tensor(
+                student_ids = None
+                if opsd_student_scoring_mode == 'masked_prompt':
+                    student_ids = torch.tensor(
+                        self.tokenizer.encode(student_prompt, add_special_tokens=False),
+                        dtype=torch.long
+                    )
+                teacher_ids = torch.tensor(
                     self.tokenizer.encode(teacher_prompt, add_special_tokens=False),
                     dtype=torch.long
                 )
@@ -504,103 +545,161 @@ class RayPPOTrainer(object):
                 if response_ids.numel() == 0:
                     continue
 
-                teacher_prompt_ids.append(prompt_ids)
-                teacher_response_ids.append(response_ids)
-                teacher_meta.append({
+                meta = {
                     'batch_idx': batch_idx,
                     'step_idx': step_idx,
                     'resp_len': response_ids.numel(),
                     'step_token_start_idx': step['token_start_idx'],
                     'step_token_end_idx': step['clean_step_token_end_idx'],
                     'reward_anchor_idx': step['token_end_idx'],
+                    'student_scoring_mode': opsd_student_scoring_mode,
+                }
+                step_records.append({
+                    'student_ids': student_ids,
+                    'teacher_ids': teacher_ids,
+                    'response_ids': response_ids,
+                    'meta': meta,
                 })
                 if batch_idx == 0 and len(debug_examples) < 3:
                     debug_examples.append({
                         'step_idx': step_idx,
+                        'student_prompt': student_prompt,
                         'teacher_prompt': teacher_prompt,
-                        'teacher_response': clean_step_text,
+                        'target_response': clean_step_text,
                         'step_token_start_idx': step['token_start_idx'],
                         'step_token_end_idx': step['clean_step_token_end_idx'],
                     })
 
-        if not teacher_meta:
+        if not step_records:
             return batch
 
-        teacher_batch = self._build_left_padded_logprob_batch(
-            teacher_prompt_ids,
-            teacher_response_ids,
-            micro_batch_size=self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size,
-        )
         for ex in debug_examples:
             print(
                 "[OPSD KL DEBUG] Teacher Example\n"
                 f"[Step Idx] {ex['step_idx']}\n"
+                f"[Student Scoring Mode] {opsd_student_scoring_mode}\n"
+                f"[Student Prompt]\n{ex['student_prompt']}\n"
                 f"[Teacher Prompt]\n{ex['teacher_prompt']}\n"
-                f"[Teacher Response]\n{ex['teacher_response']}\n"
+                f"[Target Response]\n{ex['target_response']}\n"
                 f"[Step Token Span] {ex['step_token_start_idx']} -> {ex['step_token_end_idx']}\n"
                 + "-" * 80
             )
-        
-        # breakpoint()
-        teacher_batch_padded, pad_size = pad_dataproto_to_divisor(
-            teacher_batch, self.actor_rollout_wg.world_size
+
+        opsd_token_delta = torch.zeros_like(batch.batch['token_level_scores'], dtype=torch.float32)
+        total_step_records = len(step_records)
+        total_chunks = (total_step_records + opsd_logprob_chunk_size - 1) // opsd_logprob_chunk_size
+
+        print(
+            "[OPSD KL DEBUG] Chunked LogProb Recompute\n"
+            f"[Total Step Instances] {total_step_records}\n"
+            f"[Chunk Size] {opsd_logprob_chunk_size}\n"
+            f"[Total Chunks] {total_chunks}\n"
+            f"[Student Scoring Mode] {opsd_student_scoring_mode}\n"
+            + "-" * 80
         )
-        teacher_logprob_output_padded = self.actor_rollout_wg.compute_log_prob(teacher_batch_padded)
-        teacher_logprob_output = unpad_dataproto(teacher_logprob_output_padded, pad_size=pad_size)
-        teacher_log_probs = teacher_logprob_output.batch['old_log_probs']
 
-        token_level_scores = batch.batch['token_level_scores'].clone()
-        old_log_probs = batch.batch['old_log_probs']
+        for chunk_idx in range(0, total_step_records, opsd_logprob_chunk_size):
+            chunk_records = step_records[chunk_idx:chunk_idx + opsd_logprob_chunk_size]
 
-        for meta, teacher_lp in zip(teacher_meta, teacher_log_probs):
-            batch_idx = meta['batch_idx']
-            step_start = meta['step_token_start_idx']
-            step_end = meta['step_token_end_idx']
-            resp_len = meta['resp_len']
-            if step_end < step_start:
-                continue
-
-            student_lp = old_log_probs[batch_idx, step_start:step_end + 1]
-            teacher_lp = teacher_lp[:resp_len]
-            shared_len = min(student_lp.numel(), teacher_lp.numel())
-            if shared_len <= 0:
-                continue
-
-            student_lp = student_lp[:shared_len]
-            teacher_lp = teacher_lp[:shared_len]
-
-            # Smooth the approximate KL weighting over sampled tokens instead of
-            # collapsing onto the single largest positive delta.
-            delta = teacher_lp - student_lp
-            weights = torch.softmax(delta, dim=-1)
-
-            step_list = opsd_kl_data[batch_idx]
-            num_steps = max(1, len(step_list))
-            macro_reward = batch.batch['token_level_scores'][batch_idx].sum()
-            step_reward = macro_reward / num_steps
-
-            reward_anchor_idx = meta['reward_anchor_idx']
-            token_level_scores[batch_idx, reward_anchor_idx] = 0.0
-            token_level_scores[batch_idx, step_start:step_start + shared_len] = step_reward * weights
-            if batch_idx == 0 and meta['step_idx'] < 3:
-                step_tokens = batch.batch['responses'][batch_idx, step_start:step_start + shared_len].tolist()
-                step_text = self.tokenizer.decode(step_tokens, skip_special_tokens=False)
-                print(
-                    "[OPSD KL DEBUG] Token-Level KL\n"
-                    f"[Step Idx] {meta['step_idx']}\n"
-                    f"[Step Text]\n{step_text}\n"
-                    f"[Student LogProb] {student_lp.tolist()}\n"
-                    f"[Teacher LogProb] {teacher_lp.tolist()}\n"
-                    f"[Delta] {delta.tolist()}\n"
-                    f"[Weights] {weights.tolist()}\n"
-                    f"[Macro Reward] {float(macro_reward):.6f}\n"
-                    f"[Step Reward] {float(step_reward):.6f}\n"
-                    + "-" * 80
+            student_batch = None
+            student_batch_padded = None
+            student_logprob_output_padded = None
+            student_logprob_output = None
+            if opsd_student_scoring_mode == 'masked_prompt':
+                student_batch = self._build_left_padded_logprob_batch(
+                    [record['student_ids'] for record in chunk_records],
+                    [record['response_ids'] for record in chunk_records],
+                    micro_batch_size=logprob_micro_batch_size,
                 )
-            
-            # breakpoint()
+            teacher_batch = self._build_left_padded_logprob_batch(
+                [record['teacher_ids'] for record in chunk_records],
+                [record['response_ids'] for record in chunk_records],
+                micro_batch_size=logprob_micro_batch_size,
+            )
 
-        batch.batch['token_level_scores'] = token_level_scores
+            if opsd_student_scoring_mode == 'masked_prompt':
+                student_batch_padded, student_pad_size = pad_dataproto_to_divisor(
+                    student_batch, self.actor_rollout_wg.world_size
+                )
+                student_logprob_output_padded = self.actor_rollout_wg.compute_log_prob(student_batch_padded)
+                student_logprob_output = unpad_dataproto(student_logprob_output_padded, pad_size=student_pad_size)
+                student_log_probs = student_logprob_output.batch['old_log_probs']
+            else:
+                student_log_probs = None
+
+            teacher_batch_padded, teacher_pad_size = pad_dataproto_to_divisor(
+                teacher_batch, self.actor_rollout_wg.world_size
+            )
+            teacher_logprob_output_padded = self.actor_rollout_wg.compute_log_prob(teacher_batch_padded)
+            teacher_logprob_output = unpad_dataproto(teacher_logprob_output_padded, pad_size=teacher_pad_size)
+            teacher_log_probs = teacher_logprob_output.batch['old_log_probs']
+
+            print(
+                "[OPSD KL DEBUG] Processing Chunk\n"
+                f"[Chunk Idx] {chunk_idx // opsd_logprob_chunk_size + 1}/{total_chunks}\n"
+                f"[Chunk Step Instances] {len(chunk_records)}\n"
+                + "-" * 80
+            )
+
+            if opsd_student_scoring_mode == 'masked_prompt':
+                chunk_iter = zip(chunk_records, student_log_probs, teacher_log_probs)
+            else:
+                chunk_iter = ((record, None, teacher_lp) for record, teacher_lp in zip(chunk_records, teacher_log_probs))
+
+            for record, student_lp, teacher_lp in chunk_iter:
+                meta = record['meta']
+                batch_idx = meta['batch_idx']
+                step_start = meta['step_token_start_idx']
+                step_end = meta['step_token_end_idx']
+                resp_len = meta['resp_len']
+                if step_end < step_start:
+                    continue
+
+                if opsd_student_scoring_mode == 'masked_prompt':
+                    student_lp = student_lp[:resp_len]
+                else:
+                    student_lp = batch.batch['old_log_probs'][batch_idx, step_start:step_end + 1]
+                teacher_lp = teacher_lp[:resp_len]
+                shared_len = min(student_lp.numel(), teacher_lp.numel())
+                if shared_len <= 0:
+                    continue
+
+                student_lp = student_lp[:shared_len]
+                teacher_lp = teacher_lp[:shared_len]
+
+                delta = (teacher_lp - student_lp).detach().float()
+                opsd_token_delta[batch_idx, step_start:step_start + shared_len] = delta
+                if batch_idx == 0 and meta['step_idx'] < 3:
+                    step_tokens = batch.batch['responses'][batch_idx, step_start:step_start + shared_len].tolist()
+                    step_text = self.tokenizer.decode(step_tokens, skip_special_tokens=False)
+                    print(
+                        "[OPSD KL DEBUG] Token-Level KL\n"
+                        f"[Step Idx] {meta['step_idx']}\n"
+                        f"[Student Scoring Mode] {opsd_student_scoring_mode}\n"
+                        f"[Step Text]\n{step_text}\n"
+                        f"[Student LogProb] {student_lp.tolist()}\n"
+                        f"[Teacher LogProb] {teacher_lp.tolist()}\n"
+                        f"[Delta] {delta.tolist()}\n"
+                        + "-" * 80
+                    )
+
+            del teacher_batch
+            del teacher_batch_padded
+            del teacher_logprob_output_padded
+            del teacher_logprob_output
+            del teacher_log_probs
+            if student_batch is not None:
+                del student_batch
+            if student_batch_padded is not None:
+                del student_batch_padded
+            if student_logprob_output_padded is not None:
+                del student_logprob_output_padded
+            if student_logprob_output is not None:
+                del student_logprob_output
+            if student_log_probs is not None:
+                del student_log_probs
+
+        batch.batch['opsd_token_delta'] = opsd_token_delta
         return batch
 
     def _validate(self):
@@ -984,6 +1083,28 @@ class RayPPOTrainer(object):
                             metrics.update(kl_metrics)
                         else:
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+
+                        try:
+                            opsd_weight_clip = float(self.config.algorithm.opsd_weight_clip)
+                        except Exception:
+                            opsd_weight_clip = 0.2
+                        try:
+                            opsd_mix_lambda_init = float(self.config.algorithm.opsd_mix_lambda_init)
+                        except Exception:
+                            opsd_mix_lambda_init = 0.5
+                        try:
+                            opsd_mix_lambda_decay_steps = int(self.config.algorithm.opsd_mix_lambda_decay_steps)
+                        except Exception:
+                            opsd_mix_lambda_decay_steps = 50
+
+                        if opsd_mix_lambda_decay_steps > 0:
+                            decay_ratio = max(0.0, 1.0 - float(self.global_steps) / float(opsd_mix_lambda_decay_steps))
+                            opsd_mix_lambda = opsd_mix_lambda_init * decay_ratio
+                        else:
+                            opsd_mix_lambda = opsd_mix_lambda_init
+
+                        batch.meta_info['opsd_weight_clip'] = opsd_weight_clip
+                        batch.meta_info['opsd_mix_lambda'] = opsd_mix_lambda
 
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(batch,
