@@ -70,6 +70,7 @@ local_settings.py
 image_outputs
 
 checkpoints
+verl_checkpoints/
 
 # Flask stuff:
 instance/

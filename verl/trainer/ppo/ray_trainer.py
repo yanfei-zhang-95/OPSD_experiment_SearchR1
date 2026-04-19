@@ -505,12 +505,25 @@ class RayPPOTrainer(object):
         try:
             opsd_student_scoring_mode = str(self.config.algorithm.opsd_student_scoring_mode)
         except Exception:
-            opsd_student_scoring_mode = 'masked_prompt'
-        if opsd_student_scoring_mode not in ('masked_prompt', 'rollout_old_log_prob'):
+            opsd_student_scoring_mode = 'causal_prefix'
+        if opsd_student_scoring_mode == 'masked_prompt':
+            opsd_student_scoring_mode = 'causal_prefix'
+        if opsd_student_scoring_mode not in ('causal_prefix', 'rollout_old_log_prob'):
             raise ValueError(
                 f"Unsupported algorithm.opsd_student_scoring_mode={opsd_student_scoring_mode}. "
-                "Expected 'masked_prompt' or 'rollout_old_log_prob'."
+                "Expected 'causal_prefix' or 'rollout_old_log_prob'."
             )
+        try:
+            opsd_teacher_mode = str(self.config.algorithm.opsd_teacher_mode)
+        except Exception:
+            opsd_teacher_mode = 'stale_ref_policy' if self.use_reference_policy else 'live_actor'
+        if opsd_teacher_mode not in ('live_actor', 'stale_ref_policy'):
+            raise ValueError(
+                f"Unsupported algorithm.opsd_teacher_mode={opsd_teacher_mode}. "
+                "Expected 'live_actor' or 'stale_ref_policy'."
+            )
+        if opsd_teacher_mode == 'stale_ref_policy' and not self.use_reference_policy:
+            opsd_teacher_mode = 'live_actor'
 
         step_records = []
         debug_examples = []
@@ -520,28 +533,20 @@ class RayPPOTrainer(object):
             if step_list is None:
                 continue
             for step_idx, step in enumerate(step_list):
-                student_prompt = step.get('student_prompt', '')
-                teacher_prompt = step.get('teacher_prompt', '')
+                student_context_ids = step.get('student_context_ids', None)
+                teacher_context_ids = step.get('teacher_context_ids', None)
+                target_response_ids = step.get('target_response_ids', None)
                 clean_step_text = step.get('clean_step_text', '')
-                if not teacher_prompt or not clean_step_text:
+                if teacher_context_ids is None or target_response_ids is None:
                     continue
-                if opsd_student_scoring_mode == 'masked_prompt' and not student_prompt:
+                if opsd_student_scoring_mode == 'causal_prefix' and student_context_ids is None:
                     continue
 
                 student_ids = None
-                if opsd_student_scoring_mode == 'masked_prompt':
-                    student_ids = torch.tensor(
-                        self.tokenizer.encode(student_prompt, add_special_tokens=False),
-                        dtype=torch.long
-                    )
-                teacher_ids = torch.tensor(
-                    self.tokenizer.encode(teacher_prompt, add_special_tokens=False),
-                    dtype=torch.long
-                )
-                response_ids = torch.tensor(
-                    self.tokenizer.encode(clean_step_text, add_special_tokens=False),
-                    dtype=torch.long
-                )
+                if opsd_student_scoring_mode == 'causal_prefix':
+                    student_ids = torch.tensor(student_context_ids, dtype=torch.long)
+                teacher_ids = torch.tensor(teacher_context_ids, dtype=torch.long)
+                response_ids = torch.tensor(target_response_ids, dtype=torch.long)
                 if response_ids.numel() == 0:
                     continue
 
@@ -563,8 +568,9 @@ class RayPPOTrainer(object):
                 if batch_idx == 0 and len(debug_examples) < 3:
                     debug_examples.append({
                         'step_idx': step_idx,
-                        'student_prompt': student_prompt,
-                        'teacher_prompt': teacher_prompt,
+                        'student_context': self.tokenizer.decode(student_context_ids, skip_special_tokens=False)
+                        if student_context_ids is not None else '',
+                        'teacher_context': self.tokenizer.decode(teacher_context_ids, skip_special_tokens=False),
                         'target_response': clean_step_text,
                         'step_token_start_idx': step['token_start_idx'],
                         'step_token_end_idx': step['clean_step_token_end_idx'],
@@ -577,9 +583,10 @@ class RayPPOTrainer(object):
             print(
                 "[OPSD KL DEBUG] Teacher Example\n"
                 f"[Step Idx] {ex['step_idx']}\n"
+                f"[Teacher Mode] {opsd_teacher_mode}\n"
                 f"[Student Scoring Mode] {opsd_student_scoring_mode}\n"
-                f"[Student Prompt]\n{ex['student_prompt']}\n"
-                f"[Teacher Prompt]\n{ex['teacher_prompt']}\n"
+                f"[Student Context]\n{ex['student_context']}\n"
+                f"[Teacher Context]\n{ex['teacher_context']}\n"
                 f"[Target Response]\n{ex['target_response']}\n"
                 f"[Step Token Span] {ex['step_token_start_idx']} -> {ex['step_token_end_idx']}\n"
                 + "-" * 80
@@ -594,6 +601,7 @@ class RayPPOTrainer(object):
             f"[Total Step Instances] {total_step_records}\n"
             f"[Chunk Size] {opsd_logprob_chunk_size}\n"
             f"[Total Chunks] {total_chunks}\n"
+            f"[Teacher Mode] {opsd_teacher_mode}\n"
             f"[Student Scoring Mode] {opsd_student_scoring_mode}\n"
             + "-" * 80
         )
@@ -605,7 +613,7 @@ class RayPPOTrainer(object):
             student_batch_padded = None
             student_logprob_output_padded = None
             student_logprob_output = None
-            if opsd_student_scoring_mode == 'masked_prompt':
+            if opsd_student_scoring_mode == 'causal_prefix':
                 student_batch = self._build_left_padded_logprob_batch(
                     [record['student_ids'] for record in chunk_records],
                     [record['response_ids'] for record in chunk_records],
@@ -617,7 +625,7 @@ class RayPPOTrainer(object):
                 micro_batch_size=logprob_micro_batch_size,
             )
 
-            if opsd_student_scoring_mode == 'masked_prompt':
+            if opsd_student_scoring_mode == 'causal_prefix':
                 student_batch_padded, student_pad_size = pad_dataproto_to_divisor(
                     student_batch, self.actor_rollout_wg.world_size
                 )
@@ -630,9 +638,14 @@ class RayPPOTrainer(object):
             teacher_batch_padded, teacher_pad_size = pad_dataproto_to_divisor(
                 teacher_batch, self.actor_rollout_wg.world_size
             )
-            teacher_logprob_output_padded = self.actor_rollout_wg.compute_log_prob(teacher_batch_padded)
-            teacher_logprob_output = unpad_dataproto(teacher_logprob_output_padded, pad_size=teacher_pad_size)
-            teacher_log_probs = teacher_logprob_output.batch['old_log_probs']
+            if opsd_teacher_mode == 'stale_ref_policy':
+                teacher_logprob_output_padded = self.ref_policy_wg.compute_ref_log_prob(teacher_batch_padded)
+                teacher_logprob_output = unpad_dataproto(teacher_logprob_output_padded, pad_size=teacher_pad_size)
+                teacher_log_probs = teacher_logprob_output.batch['ref_log_prob']
+            else:
+                teacher_logprob_output_padded = self.actor_rollout_wg.compute_log_prob(teacher_batch_padded)
+                teacher_logprob_output = unpad_dataproto(teacher_logprob_output_padded, pad_size=teacher_pad_size)
+                teacher_log_probs = teacher_logprob_output.batch['old_log_probs']
 
             print(
                 "[OPSD KL DEBUG] Processing Chunk\n"
@@ -641,7 +654,7 @@ class RayPPOTrainer(object):
                 + "-" * 80
             )
 
-            if opsd_student_scoring_mode == 'masked_prompt':
+            if opsd_student_scoring_mode == 'causal_prefix':
                 chunk_iter = zip(chunk_records, student_log_probs, teacher_log_probs)
             else:
                 chunk_iter = ((record, None, teacher_lp) for record, teacher_lp in zip(chunk_records, teacher_log_probs))
@@ -655,7 +668,7 @@ class RayPPOTrainer(object):
                 if step_end < step_start:
                     continue
 
-                if opsd_student_scoring_mode == 'masked_prompt':
+                if opsd_student_scoring_mode == 'causal_prefix':
                     student_lp = student_lp[:resp_len]
                 else:
                     student_lp = batch.batch['old_log_probs'][batch_idx, step_start:step_end + 1]
@@ -675,6 +688,7 @@ class RayPPOTrainer(object):
                     print(
                         "[OPSD KL DEBUG] Token-Level KL\n"
                         f"[Step Idx] {meta['step_idx']}\n"
+                        f"[Teacher Mode] {opsd_teacher_mode}\n"
                         f"[Student Scoring Mode] {opsd_student_scoring_mode}\n"
                         f"[Step Text]\n{step_text}\n"
                         f"[Student LogProb] {student_lp.tolist()}\n"
@@ -701,6 +715,15 @@ class RayPPOTrainer(object):
 
         batch.batch['opsd_token_delta'] = opsd_token_delta
         return batch
+
+    def _refresh_opsd_teacher_snapshot(self):
+        if not self.use_reference_policy:
+            return
+
+        snapshot_local_path = os.path.join(self.config.trainer.default_local_dir, 'opsd_teacher_snapshot', 'latest')
+        print(f"[OPSD SNAPSHOT] Refreshing stale teacher from actor checkpoint at step {self.global_steps}: {snapshot_local_path}")
+        self.actor_rollout_wg.save_checkpoint(snapshot_local_path, None)
+        self.ref_policy_wg.load_pretrained_model(snapshot_local_path)
 
     def _validate(self):
         """
@@ -1129,6 +1152,21 @@ class RayPPOTrainer(object):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
+
+                        try:
+                            opsd_teacher_mode = str(self.config.algorithm.opsd_teacher_mode)
+                        except Exception:
+                            opsd_teacher_mode = 'stale_ref_policy' if self.use_reference_policy else 'live_actor'
+                        try:
+                            opsd_teacher_refresh_interval = int(self.config.algorithm.opsd_teacher_refresh_interval)
+                        except Exception:
+                            opsd_teacher_refresh_interval = 10
+
+                        if (opsd_teacher_mode == 'stale_ref_policy' and self.use_reference_policy and
+                                opsd_teacher_refresh_interval > 0 and
+                                self.global_steps % opsd_teacher_refresh_interval == 0):
+                            with _timer('opsd_teacher_refresh', timing_raw):
+                                self._refresh_opsd_teacher_snapshot()
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \

@@ -28,9 +28,12 @@ export VLLM_ATTENTION_BACKEND=XFORMERS # vllm + qwen2-7b with flash_attn has som
 
 # max_prompt_length = (config['training']['max_start_length'] + config['training']['max_response_length'] * (config['training']['max_turns'] - 1) + config['training']['max_obs_length'] * config['training']['max_turns'])
 # Default OPSD / RLSD-style setting:
-#   +algorithm.opsd_student_scoring_mode=masked_prompt
+#   +algorithm.opsd_student_scoring_mode=causal_prefix
+#   +algorithm.opsd_teacher_mode=stale_ref_policy
+#   +algorithm.opsd_teacher_refresh_interval=10
 # Optional ablation:
 #   +algorithm.opsd_student_scoring_mode=rollout_old_log_prob
+#   +algorithm.opsd_teacher_mode=live_actor
 # Optional OOM fallback:
 #   +actor_rollout_ref.rollout.opsd_logprob_chunk_size=16
 
@@ -67,7 +70,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     algorithm.no_think_rl=false \
-    +algorithm.opsd_student_scoring_mode=masked_prompt \
+    +algorithm.opsd_student_scoring_mode=causal_prefix \
+    +algorithm.opsd_teacher_mode=stale_ref_policy \
+    +algorithm.opsd_teacher_refresh_interval=10 \
     +algorithm.opsd_weight_clip=0.2 \
     +algorithm.opsd_mix_lambda_init=0.5 \
     +algorithm.opsd_mix_lambda_decay_steps=50 \
@@ -80,8 +85,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.default_hdfs_dir=null \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=100 \
-    trainer.test_freq=50 \
+    trainer.save_freq=20 \
+    trainer.test_freq=20 \
     trainer.project_name=$WAND_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.total_epochs=15 \

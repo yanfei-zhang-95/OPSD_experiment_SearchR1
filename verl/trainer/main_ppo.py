@@ -47,139 +47,22 @@ class RewardManager():
         """Inject the rollout worker group to allow OPSD to compute hints and alpha scores."""
         self.actor_rollout_wg = wg
 
-    def _extract_question_text(self, data_item, prompt_str: str) -> str:
-        prompt_chat = data_item.non_tensor_batch.get('prompt')
-        if prompt_chat is not None:
-            try:
-                if isinstance(prompt_chat, list) and len(prompt_chat) > 0:
-                    content = prompt_chat[-1].get('content', '')
-                    match = re.search(r'Question:\s*(.*)', content, re.DOTALL)
-                    if match:
-                        return match.group(1).strip()
-                    return content.strip()
-            except Exception:
-                pass
-
-        raw_prompt = data_item.non_tensor_batch.get('raw_prompt')
-        if raw_prompt is not None:
-            try:
-                if isinstance(raw_prompt, list) and len(raw_prompt) > 0:
-                    content = raw_prompt[-1].get('content', '')
-                    match = re.search(r'Question:\s*(.*)', content, re.DOTALL)
-                    if match:
-                        return match.group(1).strip()
-                    return content.strip()
-            except Exception:
-                pass
-
-        match = re.search(r'Question:\s*(.*?)(?:\n\s*assistant\b|$)', prompt_str, re.DOTALL | re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-        return prompt_str.strip()
-
-    def _truncate_by_tokens(self, text: str, max_tokens: int) -> str:
-        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        if len(token_ids) <= max_tokens:
-            return text
-        return self.tokenizer.decode(token_ids[-max_tokens:], skip_special_tokens=True)
-
-    def _strip_information_tags(self, text: str) -> str:
-        return text.replace("<information>", "").replace("</information>", "")
-
     def _remove_information_block(self, text: str) -> str:
         return self.information_pattern.sub("", text)
 
-    def _format_ground_truth_answer(self, ground_truth) -> str:
-        if isinstance(ground_truth, dict):
-            target = ground_truth.get('target', ground_truth)
-        else:
-            target = ground_truth
-
-        if isinstance(target, (list, tuple)):
-            target = " | ".join(str(x) for x in target)
-        elif not isinstance(target, str):
-            target = str(target)
-
-        return self._truncate_by_tokens(target, max_tokens=128)
-
     def _score_to_correctness_label(self, score) -> str:
         try:
-            return "correct" if float(score) == 1.0 else "incorrect_or_other"
+            return "correct" if float(score) == 1.0 else "incorrect"
         except Exception:
-            return "incorrect_or_other"
+            return "incorrect"
 
-    def _build_masked_history_for_step(self, response_str: str, step_start_char_idx: int, step_end_char_idx: int) -> str:
-        step_text = response_str[step_start_char_idx:step_end_char_idx]
-        obs_match = self.information_pattern.search(step_text)
-
-        if obs_match is None:
-            masked_step_text = "[MASKED_CURRENT_STEP]"
-        else:
-            observation_block = step_text[obs_match.start():obs_match.end()]
-            masked_step_text = "[MASKED_CURRENT_STEP]\n" + observation_block
-
-        return response_str[:step_start_char_idx] + masked_step_text + response_str[step_end_char_idx:]
-
-    def _build_opsd_prompts(self,
-                            question_text: str,
-                            masked_history_for_step: str,
-                            action_type: str,
-                            correctness_label: str,
-                            ground_truth_answer: str):
-        truncated_history = self._truncate_by_tokens(masked_history_for_step, max_tokens=1536)
-
-        student_messages = [
-            {"role": "system", "content": (
-                "You are predicting the current step text for a trajectory. "
-                "Use the provided context to score the current step continuation. "
-                "Output only the current step text."
-            )},
-            {"role": "user", "content": (
-                f"Question: {question_text}\n\n"
-                f"Trajectory with the current step masked:\n{truncated_history}\n\n"
-                "Predict the current step text that should continue from this masked trajectory context. "
-                "Output only the current step text."
-            )}
-        ]
-
-        if action_type == 'answer':
-            outcome_info = f"Final correctness: {correctness_label}"
-        else:
-            outcome_info = (
-                f"Final correctness: {correctness_label}\n"
-                f"Reference answer: {ground_truth_answer}"
-            )
-
-        teacher_messages = [
-            {"role": "system", "content": (
-                "You are a privileged teacher for step-wise RL self-distillation. "
-                "Use the same masked trajectory context as the student, plus hindsight outcome information, "
-                "to score the current step continuation. "
-                "Output only the current step text."
-            )},
-            {"role": "user", "content": (
-                f"Question: {question_text}\n\n"
-                f"Trajectory with the current step masked:\n{truncated_history}\n\n"
-                f"Hindsight outcome information:\n{outcome_info}\n\n"
-                "Predict the current step text that should continue from this masked trajectory context. "
-                "Output only the current step text."
-            )}
-        ]
-
-        student_prompt_ids = self.tokenizer.apply_chat_template(
-            student_messages,
-            tokenize=True,
-            add_generation_prompt=True
+    def _build_teacher_hindsight_suffix_ids(self, correctness_label: str) -> list[int]:
+        hindsight_block = (
+            "\n<hindsight>\n"
+            f"final_correctness: {correctness_label}\n"
+            "</hindsight>\n"
         )
-        teacher_prompt_ids = self.tokenizer.apply_chat_template(
-            teacher_messages,
-            tokenize=True,
-            add_generation_prompt=True
-        )
-
-        student_prompt = self.tokenizer.decode(student_prompt_ids, skip_special_tokens=False)
-        teacher_prompt = self.tokenizer.decode(teacher_prompt_ids, skip_special_tokens=False)
-        return student_prompt, teacher_prompt
+        return self.tokenizer.encode(hindsight_block, add_special_tokens=False)
 
     def _split_response_into_steps(self, response_str: str):
         """Split a trajectory by </information> and keep the final tail step."""
@@ -247,8 +130,6 @@ class RewardManager():
             sequences = torch.cat((valid_prompt_ids, valid_response_ids))
             sequences_str = self.tokenizer.decode(sequences)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
-            prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
-
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
             data_source = data_item.non_tensor_batch['data_source']
             compute_score_fn = _select_rm_score_fn(data_source)
@@ -284,38 +165,31 @@ class RewardManager():
                     if obs_match is not None:
                         clean_step_end_char_idx = step_start_char_idx + obs_match.start()
 
-                    prefix_str = response_str[:end_char_idx]
-                    clean_prefix_str = self._strip_information_tags(prefix_str)
-                    question_text = self._extract_question_text(data_item, prompt_str)
                     action_str = f"<{action_type}>{action_content}</{action_type}>"
-                    masked_history_for_step = self._build_masked_history_for_step(
-                        response_str=response_str,
-                        step_start_char_idx=step_start_char_idx,
-                        step_end_char_idx=end_char_idx,
-                    )
                     correctness_label = self._score_to_correctness_label(score)
-                    ground_truth_answer = self._format_ground_truth_answer(ground_truth)
-                    student_prompt, teacher_prompt = self._build_opsd_prompts(
-                        question_text=question_text,
-                        masked_history_for_step=masked_history_for_step,
-                        action_type=action_type,
-                        correctness_label=correctness_label,
-                        ground_truth_answer=ground_truth_answer,
-                    )
                     
                     # Approximate token index by tokenizing the prefix
                     start_prefix_tokens = self.tokenizer.encode(response_str[:step_start_char_idx], add_special_tokens=False)
-                    prefix_tokens = self.tokenizer.encode(prefix_str, add_special_tokens=False)
                     token_start_idx = len(start_prefix_tokens)
-                    token_end_idx = len(prefix_tokens) - 1
-                    token_start_idx = max(0, min(token_start_idx, valid_response_length.item() - 1))
-                    token_end_idx = max(0, min(token_end_idx, valid_response_length.item() - 1))
+                    token_start_idx = max(0, min(token_start_idx, valid_response_length.item()))
 
                     clean_step_end_tokens = self.tokenizer.encode(
                         response_str[:clean_step_end_char_idx], add_special_tokens=False
                     )
                     clean_step_token_end_idx = len(clean_step_end_tokens) - 1
                     clean_step_token_end_idx = max(0, min(clean_step_token_end_idx, valid_response_length.item() - 1))
+                    token_end_idx = clean_step_token_end_idx
+
+                    if clean_step_token_end_idx < token_start_idx:
+                        continue
+
+                    prompt_context_ids = valid_prompt_ids.tolist()
+                    student_context_ids = prompt_context_ids + valid_response_ids[:token_start_idx].tolist()
+                    target_response_ids = valid_response_ids[token_start_idx:clean_step_token_end_idx + 1].tolist()
+                    teacher_context_ids = student_context_ids + self._build_teacher_hindsight_suffix_ids(correctness_label)
+
+                    if len(target_response_ids) == 0:
+                        continue
 
                     action_start_char_idx = response_str.find(action_str, step_start_char_idx, end_char_idx)
                     if action_start_char_idx < 0:
@@ -340,21 +214,22 @@ class RewardManager():
                         'action_token_start_idx': action_token_start_idx,
                         'action_token_end_idx': action_token_end_idx,
                         'action_type': action_type,
-                        'masked_history_for_step': masked_history_for_step,
                         'correctness_label': correctness_label,
                         'action_str': action_str,
                         'step_text': step_text,
                         'clean_step_text': clean_step_text,
-                        'original_prefix_str': clean_prefix_str,
-                        'student_prompt': student_prompt,
-                        'teacher_prompt': teacher_prompt,
+                        'student_context_ids': student_context_ids,
+                        'teacher_context_ids': teacher_context_ids,
+                        'target_response_ids': target_response_ids,
                     })
                     
                     if i == 0:  # Debug print for the first trajectory only
                         print(f"[OPSD DEBUG] Extracted Step in Traj 0 | Action: {action_type} | Token End Idx: {token_end_idx}")
                         if len(opsd_metadata) == 1:
-                            print(f"[OPSD DEBUG] Exact Student Prompt for Step 1:\n{student_prompt}\n" + "-" * 50)
-                            print(f"[OPSD DEBUG] Exact Teacher Prompt for Step 1:\n{teacher_prompt}\n" + "-" * 50)
+                            student_context_str = self.tokenizer.decode(student_context_ids, skip_special_tokens=False)
+                            teacher_context_str = self.tokenizer.decode(teacher_context_ids, skip_special_tokens=False)
+                            print(f"[OPSD DEBUG] Exact Student Context for Step 1:\n{student_context_str}\n" + "-" * 50)
+                            print(f"[OPSD DEBUG] Exact Teacher Context for Step 1:\n{teacher_context_str}\n" + "-" * 50)
 
         # Process OPSD Dense Rewards if we extracted steps. Teacher logits will
         # be recomputed later under this prompt without an intermediate hint generation step.
@@ -369,15 +244,14 @@ class RewardManager():
                     'clean_step_token_end_idx': meta['clean_step_token_end_idx'],
                     'action_token_start_idx': meta['action_token_start_idx'],
                     'action_token_end_idx': meta['action_token_end_idx'],
-                    'masked_history_for_step': meta['masked_history_for_step'],
                     'correctness_label': meta['correctness_label'],
                     'action_str': meta['action_str'],
                     'action_type': meta['action_type'],
                     'step_text': meta['step_text'],
                     'clean_step_text': meta['clean_step_text'],
-                    'original_prefix_str': meta['original_prefix_str'],
-                    'student_prompt': meta['student_prompt'],
-                    'teacher_prompt': meta['teacher_prompt'],
+                    'student_context_ids': meta['student_context_ids'],
+                    'teacher_context_ids': meta['teacher_context_ids'],
+                    'target_response_ids': meta['target_response_ids'],
                 })
                 
             opsd_kl_data = np.empty((batch_size,), dtype=object)

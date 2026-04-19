@@ -534,6 +534,36 @@ class ActorRolloutRefWorker(Worker):
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_pretrained_model(self, checkpoint_path):
+        assert self._is_ref
+
+        from verl.workers.actor import DataParallelPPOActor
+        import_external_libs(self.config.model.get('external_lib', None))
+        from omegaconf import OmegaConf
+
+        override_model_config = OmegaConf.to_container(self.config.model.get('override_config', OmegaConf.create()))
+        use_remove_padding = self.config.ref.get('use_remove_padding', self.config.model.get('use_remove_padding', False))
+        trust_remote_code = self.config.model.get('trust_remote_code', False)
+
+        if hasattr(self, 'ref_policy'):
+            del self.ref_policy
+        if hasattr(self, 'ref_module_fsdp'):
+            del self.ref_module_fsdp
+        torch.cuda.empty_cache()
+
+        self.ref_module_fsdp = self._build_model_optimizer(model_path=checkpoint_path,
+                                                           fsdp_config=self.config.ref.fsdp_config,
+                                                           optim_config=None,
+                                                           override_model_config=override_model_config,
+                                                           use_remove_padding=use_remove_padding,
+                                                           trust_remote_code=trust_remote_code)[0]
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.ref_module_fsdp, offload_grad=self._is_offload_grad)
+
+        self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+        torch.cuda.empty_cache()
+
 
 class CriticWorker(Worker):
 
