@@ -33,6 +33,7 @@ from tensordict import TensorDict
 from torch import nn
 
 from verl import DataProto
+from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
 from verl.workers.rollout.base import BaseRollout
 from verl.third_party.vllm import LLM, vllm_version
@@ -122,6 +123,28 @@ class vLLMRollout(BaseRollout):
 
         self.pad_token_id = tokenizer.pad_token_id
 
+    def _log_rollout_batch_stats(self, prompts: DataProto, stage: str):
+        attention_mask = prompts.batch['attention_mask']
+        prompt_lengths = attention_mask.sum(dim=-1)
+        batch_size = attention_mask.size(0)
+        total_prompt_tokens = int(prompt_lengths.sum().item())
+        min_prompt_len = int(prompt_lengths.min().item()) if batch_size > 0 else 0
+        max_prompt_len = int(prompt_lengths.max().item()) if batch_size > 0 else 0
+        mean_prompt_len = float(prompt_lengths.float().mean().item()) if batch_size > 0 else 0.0
+        print(
+            f"[VLLM ROLLOUT DEBUG] {stage} | "
+            f"batch_size={batch_size}, "
+            f"prompt_len_min={min_prompt_len}, prompt_len_mean={mean_prompt_len:.1f}, prompt_len_max={max_prompt_len}, "
+            f"prompt_tokens_total={total_prompt_tokens}, "
+            f"config_prompt_length={self.config.prompt_length}, "
+            f"config_response_length={self.config.response_length}, "
+            f"gpu_memory_utilization={self.config.gpu_memory_utilization}, "
+            f"free_cache_engine={self.config.free_cache_engine}, "
+            f"temperature={self.sampling_params.temperature}, "
+            f"n={self.sampling_params.n}, max_tokens={self.sampling_params.max_tokens}"
+        )
+        log_gpu_memory_usage(f'vLLM rollout memory at {stage}', rank=None)
+
     @contextmanager
     def update_sampling_params(self, **kwargs):
         # update sampling params
@@ -140,9 +163,16 @@ class vLLMRollout(BaseRollout):
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        self._log_rollout_batch_stats(prompts, stage='before_init_cache_engine')
         # rebuild vllm cache engine
         if self.config.free_cache_engine:
-            self.inference_engine.init_cache_engine()
+            try:
+                self.inference_engine.init_cache_engine()
+            except torch.OutOfMemoryError:
+                self._log_rollout_batch_stats(prompts, stage='oom_during_init_cache_engine')
+                raise
+
+        self._log_rollout_batch_stats(prompts, stage='before_generate')
 
         idx = prompts.batch['input_ids']  # (bs, prompt_length)
         # left-padded attention_mask
@@ -183,11 +213,15 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            output = self.inference_engine.generate(
-                prompts=None,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                prompt_token_ids=idx_list,
-                use_tqdm=False)
+            try:
+                output = self.inference_engine.generate(
+                    prompts=None,  # because we have already convert it to prompt token id
+                    sampling_params=self.sampling_params,
+                    prompt_token_ids=idx_list,
+                    use_tqdm=False)
+            except torch.OutOfMemoryError:
+                self._log_rollout_batch_stats(prompts, stage='oom_during_generate')
+                raise
 
         # TODO(sgm): disable logprob when recompute_log_prob is enable
         # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
@@ -233,5 +267,6 @@ class vLLMRollout(BaseRollout):
         # free vllm cache engine
         if self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
+        log_gpu_memory_usage('vLLM rollout memory after generate', rank=None)
 
         return DataProto(batch=batch)

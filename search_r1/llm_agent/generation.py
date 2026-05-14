@@ -52,6 +52,13 @@ class LLMGenerationManager:
             padding="longest"
         )['input_ids']
 
+    def _truncate_to_first_action(self, response: str) -> str:
+        """Keep only the first complete answer/search action span."""
+        match = re.search(r'<(search|answer)>(.*?)</\1>', response, re.DOTALL)
+        if match:
+            return response[:match.end()]
+        return response
+
     def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
         """Process responses to stop at search operation or answer operation."""
         responses_str = self.tokenizer.batch_decode(
@@ -59,12 +66,7 @@ class LLMGenerationManager:
             skip_special_tokens=True
         )
 
-        responses_str = [resp.split('</search>')[0] + '</search>'
-                 if '</search>' in resp 
-                 else resp.split('</answer>')[0] + '</answer>'
-                 if '</answer>' in resp 
-                 else resp
-                 for resp in responses_str]
+        responses_str = [self._truncate_to_first_action(resp) for resp in responses_str]
 
         if self.config.no_think_rl:
             raise ValueError('stop')
@@ -175,6 +177,10 @@ class LLMGenerationManager:
             then remove padding from output
         """
         world_size = getattr(self.actor_rollout_wg, 'world_size', self.config.num_gpus)
+        # Agent loop only needs generated tokens here. Old log probs are recomputed
+        # once on the final composed batch before PPO updates, so skip the expensive
+        # intermediate recomputation path in `generate_sequences`.
+        active_batch.meta_info['recompute_log_prob'] = False
         if world_size <= 1:
             return self.actor_rollout_wg.generate_sequences(active_batch)
 

@@ -1,0 +1,265 @@
+\documentclass[11pt]{article}
+\usepackage[review]{acl}
+
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{graphicx}
+
+\title{Agentic OPSD: Does Step-Aware Online Preference Distillation Improve Self-Awareness in Search Agents?}
+
+\author{Anonymous ACL Submission}
+
+\newcommand{\method}{Agentic OPSD}
+\newcommand{\grpo}{GRPO}
+\newcommand{\ppo}{PPO}
+\newcommand{\searchr}{Search-R1}
+\newcommand{\R}{\mathbb{R}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Agentic large language models must decide not only what answer to produce, but also when to search, whether the current evidence is sufficient, when to stop, and how to recover from invalid actions. These behaviors are closely related to an operational notion of self-awareness: the agent's ability to assess its own informational state during multi-turn interaction. In this paper, we study \method, a step-aware extension of OPD-style online distillation for search agents. Built on top of the \searchr{} training pipeline, \method{} leaves rollout and environment interaction unchanged and instead inserts token-level credit shaping between sparse task reward construction and advantage-based policy optimization. We argue that this design should be analyzed primarily through the lens of agent self-awareness rather than only final-task accuracy. To that end, we present a conceptual formulation of Agentic OPSD, relate it to agentic reinforcement learning and OPD-style optimization, and propose an experimental framework that measures uncertainty awareness, search necessity awareness, stopping awareness, and error awareness. Our central hypothesis is that Agentic OPSD improves search agents by concentrating learning signal on decision-relevant steps, thereby producing better calibrated meta-decisions about when to search, when to answer, and when to revise behavior.
+\end{abstract}
+
+\section{Introduction}
+Large language models are increasingly deployed as agents that must not only produce a final answer, but also decide when to search, what to search for, how long to continue interacting with the environment, and when to terminate with a confident response. This transition from static text generation to multi-turn tool-augmented interaction creates a new optimization challenge. In standard reasoning RL, a trajectory is usually a single response whose quality can be summarized by an outcome reward. In agentic settings, however, the same sparse outcome reward must supervise a much richer sequence of intermediate decisions, including search calls, invalid actions, observation consumption, and delayed answer synthesis. As a result, learning becomes a credit-assignment problem over long, heterogeneous trajectories rather than a pure sequence-level preference problem.
+
+Recent agentic RL work has shown that reinforcement learning can induce useful tool-use behaviors from relatively weak supervision, especially when the environment exposes an external search API or another executable tool \citep{jin2025search,jin2025empirical,yao2023react,schick2023toolformer}. Nevertheless, the dominant training signal in many practical systems remains sparse: a final exact-match score, a correctness label, or a task-level preference. Such signals are effective for selecting good completed trajectories, but they are inefficient for teaching the agent which intermediate decisions were responsible for success or failure. This gap becomes especially severe for search agents, where the final reward is jointly determined by several coupled decisions: whether a search action was issued, whether the query was useful, whether retrieved evidence was incorporated correctly, and whether the final answer was emitted at the right time.
+
+This motivates extending OPD-style methods from ordinary response optimization to agent trajectories. At a high level, OPD-style methods use an online teacher--student comparison during policy improvement, so that preference information is transformed into a denser local training signal. While this idea is natural for single-response alignment, it is not obvious how to apply it to agents. Agent trajectories contain alternating phases of reasoning, acting, and observation incorporation; the meaningful local unit is no longer the whole response, but the step or decision segment. Therefore, an agentic extension must answer two questions: (1) how to segment an interaction trajectory into trainable local units, and (2) how to inject teacher guidance without changing the environment dynamics or introducing unstable off-policy bias.
+
+In this paper, we study \method, a step-aware extension of OPD-style online distillation for multi-turn search agents. Built on top of the \searchr{} training pipeline, \method{} keeps the original rollout process unchanged: the agent still interacts with the search environment under standard \grpo{} updates and receives a sparse task reward at the end of the response. The key modification happens after rollout and reward computation but before advantage-based optimization. We extract action-centered step segments from each trajectory, score them under a student context and a teacher context, compute token-level log-probability deltas, and use these deltas to reshape the effective advantages for policy optimization. In this sense, \method{} is not another environment reward or another planner; it is a credit-shaping mechanism for agent RL.
+
+This design is important for two reasons. First, it preserves the original agent-environment interaction interface, which keeps the training system simple and avoids entangling search execution with the distillation mechanism. Second, it yields a precise scientific question: does Agentic OPSD change the self-awareness of an agentic model, and if so, how? Because \method{} does not alter the tool API, action space, or base RL objective, any behavioral change must arise through modified credit assignment. This makes it possible to study whether the method improves the agent's ability to recognize when it lacks enough information, when a search action is needed, when retrieved evidence is sufficient, and when it should stop searching and answer.
+
+Our contributions are as follows:
+\begin{itemize}[leftmargin=1.5em]
+    \item We formulate an agentic extension of OPD-style online distillation that operates on step segments rather than whole responses.
+    \item We instantiate this idea as \method{}, a token-level advantage shaping method for search agents trained with \grpo{}.
+    \item We argue that \method{} should be studied primarily through the lens of agent self-awareness, operationalized as uncertainty recognition, search necessity judgment, stopping awareness, and error awareness under multi-turn interaction.
+    \item We design a controlled experimental protocol to identify whether \method{} changes the self-awareness of the resulting agent, and to connect this change to action quality, trajectory efficiency, and token-level credit concentration.
+\end{itemize}
+
+\section{Literature Review}
+\subsection{Agentic RL for Language Models}
+The recent rise of reasoning-capable LLMs has renewed interest in reinforcement learning as a way to improve long-horizon reasoning and decision making. Classic policy-gradient methods such as \ppo{} remain the conceptual backbone \citep{schulman2017ppo}, while recent LLM-specific variants such as \grpo{} simplify optimization by replacing value estimation with group-relative normalization \citep{deepseekr1}. These methods were first popularized in reasoning settings where the model produces a single long chain-of-thought and receives an outcome-level reward. Their success suggests that RL can shape latent reasoning strategies even when only weak supervision is available.
+
+Agentic RL extends this paradigm by embedding the model inside an interactive loop. Instead of only generating a final response, the model alternates between internal reasoning and explicit actions such as search, browsing, code execution, or routing. This setup is much closer to sequential decision making under partial observability. Work such as ReAct \citep{yao2023react} established the importance of interleaving reasoning traces and external actions, while Toolformer \citep{schick2023toolformer} showed that models can learn to insert tool calls into language generation. More recent search-agent systems push this further by optimizing behavior with RL rather than prompting or supervised imitation alone \citep{jin2025search,jin2025empirical}. A central theme across these works is that the policy must learn when external information is worth acquiring and how that information should influence subsequent reasoning.
+
+Despite their differences, most agentic RL methods still depend heavily on sparse or semi-sparse task rewards. This is practical, but it creates a structural bottleneck: the reward arrives only after the trajectory has already committed to several decisions. Consequently, poor local actions may be weakly penalized, and successful local decisions may receive insufficient positive credit. This motivates methods that densify supervision without replacing the environment reward altogether.
+
+\subsection{OPD-Style Distillation and Preference-Based Optimization}
+OPD-style methods can be broadly understood as online teacher--student procedures that transform global preference or correctness signals into local policy-improvement guidance. They are closely related to policy distillation \citep{rusu2015policy}, preference optimization \citep{rafailov2024dpo,azar2024ipo}, and self-improving alignment pipelines in which the current policy, a reference policy, or a stronger model supplies a comparative signal during training. The common goal is to avoid relying solely on supervised targets or pure sparse RL, and instead to exploit pairwise or relative information about how the policy should shift.
+
+Within LLM alignment, preference optimization methods usually operate at the response level: given a prompt and a preferred completion, the policy is updated to increase the likelihood of preferred outputs relative to dispreferred ones. However, agentic trajectories complicate this picture. A whole trajectory may be globally preferred because of one critical search action, one successful evidence integration step, or one correctly timed termination decision. Response-level distillation cannot easily locate these causal substructures. Therefore, a direct application of preference optimization to full trajectories can miss the very decisions that matter most for agent competence.
+
+This is the conceptual space in which \method{} operates. It borrows the online comparative spirit of OPD-style methods, but adapts the comparison unit from response to step segment. Rather than distilling a globally preferred trajectory into a whole-response log-ratio objective, it computes local teacher--student differences over action-centered segments and uses them to reweight token-level advantages. Compared with standard preference optimization, this makes the distillation signal more compatible with multi-turn RL. Compared with pure policy distillation, it remains grounded in environment reward and does not require a fully separate expert policy.
+
+\subsection{Predictive Modeling, Calibration, and Structured Computation}
+Several primary research threads are useful for grounding the notion of operational self-awareness studied in this paper. The first concerns predictive internal modeling. In model-based RL, systems such as World Models \citep{ha2018worldmodels}, PlaNet \citep{hafner2019planet}, Dreamer \citep{hafner2020dreamer}, and MuZero \citep{schrittwieser2020muzero} improve control by learning compact predictive structure over future observations, rewards, or latent states. More recently, world-model ideas have begun to enter language-agent settings as well, for example in web navigation agents that simulate action consequences before acting \citep{chae2024web}. Across these works, better decisions arise not only from stronger policies but from better internal anticipation of what different actions will cause.
+
+The second thread concerns self-knowledge and calibration in language models. \citet{kadavath2022know} show that language models can often estimate whether they know an answer, suggesting that meta-judgment about knowledge sufficiency is at least partially measurable. This is directly relevant for search agents: before issuing \texttt{search} or \texttt{answer}, the policy must implicitly judge whether the current context is already sufficient. In our setting, we treat this ability as a behavioral form of self-monitoring rather than as a hidden cognitive state.
+
+The third thread concerns structured and interpretable computation. Neural Module Networks \citep{andreas2016nmn} and Concept Bottleneck Models \citep{koh2020cbm} illustrate a broader idea that decision quality can benefit when internal computation is organized around semantically meaningful or functionally specialized intermediate structure. Although these methods are not designed for agentic RL, they motivate our analysis of whether optimization mass is assigned to the right parts of a trajectory. Our method is complementary to this line of work: \method{} does not redesign the backbone into explicit modules or concept bottlenecks, but it does reshape learning signals so that action-relevant spans receive sharper credit.
+
+Taken together, these threads motivate a concrete research question for agentic RL. Rather than asking whether Agentic OPSD induces self-awareness in a broad philosophical sense, we ask whether it improves operational self-monitoring in multi-turn search: can the model better detect missing information, better judge the need for search, better recognize when enough evidence has been obtained, and better recover from action errors? This framing is measurable, mechanism-oriented, and tightly aligned with the token-level credit-shaping design of \method{}.
+
+\section{Preliminary}
+\subsection{Agentic Search as Sequential Decision Making}
+We model a search-augmented LLM as a policy $\pi_{\theta}$ interacting with an environment over multiple turns. Given a question $x$, the agent produces a trajectory
+\begin{equation}
+\tau = (s_1, a_1, o_1, s_2, a_2, o_2, \dots, s_T, a_T),
+\end{equation}
+where $s_t$ is the textual state available at turn $t$, $a_t$ is the generated action segment, and $o_t$ is the observation returned by the environment when the action is a search call. In the \searchr{} setting, each action is represented by a tagged text span such as \texttt{<search>...</search>} or \texttt{<answer>...</answer>}. The environment parses the generated span, decides whether it is valid, optionally performs retrieval, and appends an observation block to the rolling context.
+
+The agent operates under partial observability because future evidence is unavailable until a search action is issued. The final answer quality depends on both the latent reasoning content and the external information acquired during interaction. Therefore, the optimization problem is best understood as long-horizon text-based control rather than ordinary one-shot generation.
+
+\subsection{Sparse Outcome Reward and \grpo{}}
+In the base system, each completed trajectory receives a task-level scalar reward, for example exact match on the final answer. Let $R(\tau)$ denote the outcome reward. This reward is converted into a sparse token-level score by assigning it to the final valid response token. The resulting token-level reward sequence is then used by \grpo{} to compute normalized advantages within groups of repeated rollouts.
+
+Let $y_{1:L}$ be the response tokens and let $r_{\ell}$ denote the token-level reward. In the sparse setting,
+\begin{equation}
+r_{\ell} =
+\begin{cases}
+R(\tau), & \ell = L_{\text{final}},\\
+0, & \text{otherwise}.
+\end{cases}
+\end{equation}
+The policy is then updated by a clipped policy-gradient objective based on old log-probabilities and normalized advantages, analogous to standard RLHF pipelines \citep{schulman2017ppo,deepseekr1}.
+
+This setup is effective but coarse. The same final reward supervises query generation, invalid-action recovery, search-result consumption, and answer emission. As trajectory length grows, the final reward becomes a weak proxy for local decision quality. From the perspective of self-awareness, this means the baseline objective offers only limited supervision about whether the agent correctly judged its own information sufficiency at intermediate turns.
+
+\subsection{Why OPD-Style Extensions Are Needed for Agents}
+In a single-response setting, response-level preference optimization often suffices because the unit of optimization and the unit of evaluation are nearly aligned. In an agentic setting they are not. Evaluation remains trajectory-level, but the causal structure is step-level. A failed trajectory may contain several locally good steps followed by one fatal mistake; a successful trajectory may rely on only one high-value search decision. Therefore, an OPD-style method for agents should satisfy three constraints: it should preserve the online rollout process and not require rewriting the environment; it should localize comparative supervision to step segments rather than entire trajectories; and it should integrate naturally with advantage-based RL updates. These constraints directly motivate \method{}.
+
+\section{Method}
+\subsection{Overview}
+\method{} extends OPD-style online distillation to multi-turn search agents. The method keeps rollout, reward computation, and the base \grpo{} update intact, and inserts an additional step-aware credit-shaping stage between reward construction and advantage-based policy optimization. The full training order is:
+\begin{equation}
+\begin{aligned}
+\text{rollout}
+&\rightarrow \text{log-prob recomputation} \\
+&\rightarrow \text{task reward} \\
+&\rightarrow \text{Agentic OPSD shaping} \\
+&\rightarrow \text{advantage computation} \\
+&\rightarrow \text{policy update}
+\end{aligned}
+\end{equation}
+
+This decomposition matters conceptually. Because \method{} does not intervene during environment interaction, it does not change the action space, search API, or observation function. Instead, it changes how the completed trajectory is interpreted by the optimizer. Thus, any downstream behavioral improvement can be traced to better credit assignment. Our central hypothesis is that better credit assignment improves a search agent's operational self-awareness: the policy becomes better at recognizing when it needs information, when an action is malformed, and when enough evidence has been accumulated to stop.
+
+\begin{figure*}[t]
+  \centering
+  \IfFileExists{agentic_rlsd_overview.png}{
+    \includegraphics[width=\textwidth]{agentic_rlsd_overview.png}
+  }{
+    \fbox{
+      \parbox{0.95\textwidth}{
+        \centering
+        Figure placeholder. Save the overview image as
+        \texttt{agentic\_rlsd\_overview.png} under the current ACL template
+        directory to render it here.
+      }
+    }
+  }
+  \caption{Overview of Agentic RLSD / Agentic OPSD. The figure illustrates three components: the unchanged multi-turn agent rollout with sparse task reward, the token-level credit-shaping mechanism inside the trajectory, and the hypothesized behavioral effect of improved operational self-awareness, including uncertainty awareness, search-necessity awareness, stopping awareness, and error-aware recovery.}
+  \label{fig:agentic-opsd-overview}
+\end{figure*}
+
+\subsection{Step Extraction from Agent Trajectories}
+Given a completed response, we segment it into step units using observation boundaries and action tags. Each step contains an action-centered text segment and may include a subsequent information block returned by the search engine. For each step $k$, we record the prefix context before the step, the clean step text without observation content, the token span corresponding to the step in the final response, and the action type such as \texttt{search} or \texttt{answer}. This extraction is tailored to agent trajectories. Unlike ordinary chain-of-thought segmentation, the boundaries are semantically tied to environment interaction, which makes the resulting units suitable for action-aware credit shaping.
+
+\subsection{Teacher and Student Contexts}
+For each step $k$, let $c_k^S$ denote the student context and $z_k$ denote the step tokens to be rescored. The student context contains the original prompt and all response tokens before the current step. We then build a teacher context $c_k^T$ by appending a hindsight suffix that summarizes final trajectory correctness:
+\begin{equation}
+c_k^T = c_k^S \oplus h(R(\tau)),
+\end{equation}
+where $h(\cdot)$ maps the final outcome to a short textual hint such as whether the final trajectory was correct or incorrect. Intuitively, the teacher context represents how the policy would score the current step if it had access to hindsight about the eventual outcome.
+
+The implementation supports two teacher modes: a live actor rescoring the step under the teacher context, and a stale reference policy used as a delayed teacher snapshot for more stable comparisons. Likewise, the student score can be computed from a reconstructed causal prefix or reused from rollout log-probabilities, yielding two student modes.
+
+\subsection{Token-Level OPSD Delta}
+For each step token $z_{k,j}$, we compute a teacher--student log-probability delta:
+\begin{equation}
+\begin{aligned}
+\Delta_{k,j} =
+\log \pi_T(z_{k,j} \mid c_k^T, z_{k,<j})
+\\
+&\quad - \log \pi_S(z_{k,j} \mid c_k^S, z_{k,<j}).
+\end{aligned}
+\end{equation}
+The deltas are written back to the corresponding token positions in the final response, producing a token-level tensor $\Delta \in \R^L$ aligned with the trajectory. Tokens not covered by extracted steps receive zero delta.
+
+This operation can be viewed as a localized hindsight comparison. If the teacher assigns higher probability than the student to a token inside a successful step, the method interprets that token as deserving stronger positive credit. Conversely, if the teacher discounts a token under hindsight, the method reduces its effective influence on the update.
+
+\subsection{Advantage Shaping}
+Let $A_{\ell}$ be the original token-level advantage after sparse reward construction and group normalization. \method{} converts the delta tensor into multiplicative weights:
+\begin{equation}
+w_{\ell}^{\text{raw}} = \exp(\mathrm{sign}(A_{\ell}) \cdot \Delta_{\ell}),
+\end{equation}
+followed by clipping:
+\begin{equation}
+w_{\ell} = \mathrm{clip}(w_{\ell}^{\text{raw}}, 1-\alpha, 1+\alpha),
+\end{equation}
+where $\alpha$ is a weight-clipping hyperparameter. Finally, the shaped advantage is
+\begin{equation}
+\tilde{A}_{\ell} = \left[(1-\lambda) + \lambda w_{\ell}\right] A_{\ell},
+\end{equation}
+where $\lambda$ controls the interpolation strength and may decay over training.
+
+This formulation has several useful properties. First, it is compatible with standard advantage-based RL and requires no new policy objective. Second, clipping prevents unstable reweighting. Third, because the sign of the original advantage is preserved, the method primarily changes magnitude rather than the direction of the update. In other words, \method{} shapes where the optimizer focuses within a trajectory.
+
+\section{Experiments}
+\subsection{Research Questions}
+Our experiments are designed to answer four questions. First, does \method{} improve final task performance for search agents trained with \grpo{}? Second, does it improve operational self-awareness, namely the agent's ability to recognize when search is necessary, when evidence is sufficient, and when an action is invalid or unproductive? Third, are these behavioral changes associated with more concentrated token-level credit around action-relevant spans? Fourth, which design choices inside Agentic OPSD matter most, such as teacher mode, student scoring mode, and shaping strength?
+
+\subsection{Experimental Setup}
+\subsubsection{Compared Methods}
+All models should be trained with the same base architecture, data pipeline, retrieval backend, rollout budget, and \grpo{} optimizer settings. We compare a baseline \grpo{} search agent without Agentic OPSD against variants with live-actor teacher scoring, stale-reference teacher scoring, and rollout-log-prob student reuse. This comparison isolates the effect of step-aware OPSD shaping from the rest of the training system.
+
+\subsubsection{Basic Config}
+This subsection is reserved for the core experimental configuration. It should report the backbone model, training data, search engine, optimizer settings, batch sizes, maximum numbers of turns, and OPSD-specific hyperparameters.
+
+\paragraph{Configuration placeholder.}
+The final paper should include a compact table or paragraph covering at least the following items: base model; train/validation datasets; retriever type and top-$k$; maximum turns; response and observation length limits; training steps; learning rate; \grpo{} group size; OPSD teacher mode; OPSD student scoring mode; OPSD clipping threshold; and the schedule for the shaping coefficient.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{ll}
+\toprule
+Item & Value \\
+\midrule
+Backbone model & \textit{to be filled} \\
+Training data & \textit{to be filled} \\
+Retriever & \textit{to be filled} \\
+Max turns & \textit{to be filled} \\
+Train steps & \textit{to be filled} \\
+Learning rate & \textit{to be filled} \\
+Teacher mode & \textit{to be filled} \\
+Student mode & \textit{to be filled} \\
+Weight clip & \textit{to be filled} \\
+Mixing schedule & \textit{to be filled} \\
+\bottomrule
+\end{tabular}
+\caption{Basic experimental configuration placeholder.}
+\label{tab:basic-config}
+\end{table}
+
+\subsubsection{Datasets and Evaluation}
+We recommend evaluating on both in-domain open-domain QA and multi-hop QA benchmarks. At minimum, the setup should distinguish questions that are retrieval-required from questions that can often be answered from parametric knowledge alone. Final answer quality can be measured with exact match, but our main analysis targets self-awareness-related behavioral metrics.
+
+\subsection{Current Training Result}
+This subsection is reserved for the current available result from the existing training run. Even if the full experiment suite is not yet complete, the paper should report at least one concrete training result so that the method section is connected to an actual empirical outcome.
+
+\paragraph{Result placeholder.}
+The final version should summarize one currently available model checkpoint and its corresponding validation or test performance. Ideally this includes exact match, average number of turns, valid-action ratio, valid-search count, and any currently logged OPSD statistics.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+Model & EM & Turns & Valid Act. & Valid Search & Notes \\
+\midrule
+Baseline & \textit{--} & \textit{--} & \textit{--} & \textit{--} & \textit{to be filled} \\
+\method{} & \textit{--} & \textit{--} & \textit{--} & \textit{--} & \textit{current run} \\
+\bottomrule
+\end{tabular}
+\caption{Current training result placeholder.}
+\label{tab:current-result}
+\end{table}
+
+\subsection{Self-Awareness Evaluation}
+Since self-awareness is an abstract concept, we operationalize it through observable behavioral proxies. In this paper, an agent is considered more self-aware if it searches more often on questions that genuinely require external information and less often on questions answerable from parametric knowledge alone; if it answers only after sufficient evidence has been accumulated; if it detects invalid or unhelpful actions and recovers with fewer extra turns; and if its search decisions are better calibrated with downstream success. Under this definition, self-awareness is not a hidden mental state but a measurable form of meta-decision quality.
+
+The experimental analysis should center on four axes. First, self-awareness under missing information: measure the search rate on retrieval-required questions, the search rate on answerable-without-search questions, the gap between these two rates as a search-necessity calibration score, the probability of early answer without search on retrieval-required questions, and exact match conditioned on the first action being \texttt{search} versus \texttt{answer}. Second, stopping awareness: measure the average number of turns before final answer, finish ratio, over-search rate, under-search rate, and answer-after-evidence ratio. Third, error awareness and recovery: measure valid-action ratio, invalid-action recovery rate, the number of extra turns after the first invalid action, and the probability that an invalid action is followed by a valid search or answer in the next turn. Fourth, credit-assignment geometry: log the mean and variance of OPSD token weights, the fraction of total weight mass allocated to action tokens, the fraction allocated to observation-adjacent reasoning tokens, the correlation between step-level average delta and final correctness, the divergence between shaped and unshaped advantages, and the correlation between action-token weight mass and self-awareness metrics from the first three axes.
+
+To make the analysis decisive, we further recommend logging three diagnostic statistics during training and validation: action-token weight mass, step-level delta summaries, and self-awareness buckets defined by whether search was necessary, whether the first action was correct, and whether the final answer was emitted before or after evidence acquisition.
+
+\subsection{Discussion and Further Ablation Study}
+This subsection is reserved for deeper interpretation and ablation analysis. The goal is to move beyond the question of whether \method{} works and address why it works.
+
+\paragraph{Suggested ablations.}
+We recommend at least the following ablations: live-actor teacher versus stale-reference teacher; causal-prefix student scoring versus rollout-log-prob reuse; different OPSD clipping thresholds; different mixing schedules; and a variant that disables step-aware shaping while keeping all other training settings fixed.
+
+\paragraph{Discussion placeholder.}
+The final paper should discuss whether gains mainly come from better search-necessity calibration, better stopping behavior, or improved invalid-action recovery. If \method{} mainly improves final exact match but leaves the self-awareness metrics unchanged, then it behaves more like a general regularizer than a meta-decision improver. If it increases search-necessity calibration, reduces early answers on retrieval-required questions, and improves invalid-action recovery, then the evidence supports our main claim: \method{} changes the agent primarily by improving operational self-awareness through better credit assignment over tool-use decisions.
+
+\section*{Limitations}
+This paper currently focuses on the conceptual framing and experimental design of Agentic OPSD rather than a full empirical study. As a result, the proposed self-awareness analysis remains a hypothesis until validated by controlled experiments. In addition, our operational definition of self-awareness is behavioral and task-specific. It captures meta-decision quality in search environments, but it should not be interpreted as a claim about broader machine self-awareness in a philosophical sense. Finally, the proposed metrics depend on the ability to classify whether search was necessary for a given question, which may itself require careful annotation or heuristic construction.
+
+\bibliography{custom}
+
+\end{document}

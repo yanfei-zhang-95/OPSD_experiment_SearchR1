@@ -165,6 +165,7 @@ algorithm:
 trainer:
   total_epochs: 30
   total_training_steps: null
+  seed: 42
   project_name: verl_examples
   experiment_name: gsm8k
   logger: [ 'console', 'wandb' ]
@@ -175,6 +176,10 @@ trainer:
   critic_warmup: 0
   default_hdfs_dir: ~/experiments/gsm8k/ppo/${trainer.experiment_name}
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  resume_from_path: null
+  resume_run_initial_validation: false
+  wandb_run_id: null
+  wandb_resume: null
 
 max_turns: 10
 do_search: true

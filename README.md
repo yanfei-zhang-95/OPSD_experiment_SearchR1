@@ -17,7 +17,8 @@ conda install -c pytorch -c nvidia faiss-gpu=1.8.0
 ## API function
 pip install uvicorn fastapi
 
-路径要注意改一下
+路径要注意改一下，在retrieval_server.py里面的data_path = "/data/yanfeizhang/SES/local_wiki_server/wiki-18-e5-index"
+
 启动download.sh、download_model.py，下载所有数据集
 运行nq_search.py，把数据集给处理好
 然后启动retrieval_launch.sh，等待加载即可

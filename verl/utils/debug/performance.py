@@ -19,10 +19,23 @@ import logging
 
 def log_gpu_memory_usage(head: str, logger: logging.Logger = None, level=logging.DEBUG, rank: int = 0):
     if (not dist.is_initialized()) or (rank is None) or (dist.get_rank() == rank):
-        memory_allocated = torch.cuda.memory_allocated() / 1024**3
-        memory_reserved = torch.cuda.memory_reserved() / 1024**3
+        device = torch.cuda.current_device()
+        memory_allocated = torch.cuda.memory_allocated(device) / 1024**3
+        memory_reserved = torch.cuda.memory_reserved(device) / 1024**3
+        memory_stats = torch.cuda.mem_get_info(device)
+        memory_free = memory_stats[0] / 1024**3
+        memory_total = memory_stats[1] / 1024**3
+        max_memory_allocated = torch.cuda.max_memory_allocated(device) / 1024**3
+        max_memory_reserved = torch.cuda.max_memory_reserved(device) / 1024**3
 
-        message = f'{head}, memory allocated (GB): {memory_allocated}, memory reserved (GB): {memory_reserved}'
+        message = (
+            f'{head}, memory allocated (GB): {memory_allocated}, '
+            f'memory reserved (GB): {memory_reserved}, '
+            f'memory free (GB): {memory_free}, '
+            f'memory total (GB): {memory_total}, '
+            f'max allocated (GB): {max_memory_allocated}, '
+            f'max reserved (GB): {max_memory_reserved}'
+        )
 
         if logger is None:
             print(message)

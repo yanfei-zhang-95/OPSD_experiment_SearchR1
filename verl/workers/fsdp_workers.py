@@ -23,7 +23,7 @@ import torch
 import torch.distributed
 import verl.utils.hdfs_io as hdfs_io
 import verl.utils.torch_functional as verl_F
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 from verl import DataProto
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import register, Dispatch
@@ -42,6 +42,18 @@ from codetiming import Timer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
+
+
+def _recursive_to_cpu(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _recursive_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_recursive_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_recursive_to_cpu(v) for v in obj)
+    return obj
 
 
 class ActorRolloutRefWorker(Worker):
@@ -281,6 +293,49 @@ class ActorRolloutRefWorker(Worker):
 
         return rollout, rollout_sharding_manager
 
+    def _get_actor_resume_path(self):
+        resume_path = self.config.actor.get('resume_from_path', None)
+        if resume_path in (None, '', 'null'):
+            return None
+        return resume_path
+
+    def _get_optimizer_shard_path(self, checkpoint_path: str, prefix: str) -> str:
+        return os.path.join(checkpoint_path, f'{prefix}_optimizer_rank_{self.rank:05d}.pt')
+
+    def _get_scheduler_state_path(self, checkpoint_path: str, prefix: str) -> str:
+        return os.path.join(checkpoint_path, f'{prefix}_lr_scheduler.pt')
+
+    def _save_actor_training_state(self, local_path: str):
+        if not self._is_actor:
+            return
+
+        os.makedirs(local_path, exist_ok=True)
+        optimizer_state_path = self._get_optimizer_shard_path(local_path, 'actor')
+        torch.save(_recursive_to_cpu(self.actor_optimizer.state_dict()), optimizer_state_path)
+
+        if self.rank == 0:
+            scheduler_state_path = self._get_scheduler_state_path(local_path, 'actor')
+            torch.save(self.actor_lr_scheduler.state_dict(), scheduler_state_path)
+
+    def _load_actor_training_state(self, checkpoint_path: str):
+        if not self._is_actor:
+            return
+
+        local_path = copy_local_path_from_hdfs(checkpoint_path)
+        optimizer_state_path = self._get_optimizer_shard_path(local_path, 'actor')
+        scheduler_state_path = self._get_scheduler_state_path(local_path, 'actor')
+
+        if not os.path.exists(optimizer_state_path):
+            raise FileNotFoundError(f'Actor optimizer state not found: {optimizer_state_path}')
+        if not os.path.exists(scheduler_state_path):
+            raise FileNotFoundError(f'Actor scheduler state not found: {scheduler_state_path}')
+
+        optimizer_state = torch.load(optimizer_state_path, map_location='cpu')
+        scheduler_state = torch.load(scheduler_state_path, map_location='cpu')
+        self.actor_optimizer.load_state_dict(optimizer_state)
+        self.actor_lr_scheduler.load_state_dict(scheduler_state)
+        print(f'[RESUME] Loaded actor optimizer and scheduler state from {local_path} on rank {self.rank}')
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
@@ -297,11 +352,13 @@ class ActorRolloutRefWorker(Worker):
             if self._is_actor:
                 optim_config = self.config.actor.optim
                 fsdp_config = self.config.actor.fsdp_config
+                actor_model_path = self._get_actor_resume_path() or self.config.model.path
             else:
                 optim_config = None
                 fsdp_config = OmegaConf.create()
+                actor_model_path = self.config.model.path
             self.actor_module_fsdp, self.actor_optimizer, self.actor_lr_scheduler, self.actor_model_config = self._build_model_optimizer(
-                model_path=self.config.model.path,
+                model_path=actor_model_path,
                 fsdp_config=fsdp_config,
                 optim_config=optim_config,
                 override_model_config=override_model_config,
@@ -316,9 +373,6 @@ class ActorRolloutRefWorker(Worker):
                 # param is require during state_dict in sharding manager
                 offload_fsdp_grad(module=self.actor_module_fsdp)
                 log_gpu_memory_usage('After offload actor grad during init', logger=logger)
-            if self._is_offload_optimizer:
-                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-                log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
         # load from checkpoint
         if self._is_actor:
             OmegaConf.set_struct(self.config.actor, True)
@@ -327,6 +381,12 @@ class ActorRolloutRefWorker(Worker):
             self.actor = DataParallelPPOActor(config=self.config.actor,
                                               actor_module=self.actor_module_fsdp,
                                               actor_optimizer=self.actor_optimizer)
+            actor_resume_path = self._get_actor_resume_path()
+            if actor_resume_path is not None:
+                self._load_actor_training_state(actor_resume_path)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+                log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout()
@@ -365,6 +425,8 @@ class ActorRolloutRefWorker(Worker):
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
 
         data.batch = data.batch.cuda()
+        if 'temperature' not in data.meta_info:
+            data.meta_info['temperature'] = self.config.rollout.temperature
 
         log_gpu_memory_usage('Before update policy', logger=logger)
 
@@ -409,7 +471,18 @@ class ActorRolloutRefWorker(Worker):
                                      load_grad=self._is_offload_grad)
 
         data.batch = data.batch.cuda()
-        meta_info = {'eos_token_id': self.tokenizer.eos_token_id, 'pad_token_id': self.tokenizer.pad_token_id}
+        meta_info = {
+            'eos_token_id': self.tokenizer.eos_token_id,
+            'pad_token_id': self.tokenizer.pad_token_id,
+            # Some callers (for example the search-agent final composed batch)
+            # only provide tensors and omit rollout log-prob metadata.
+            # Fall back to rollout defaults so `actor.compute_log_prob` always
+            # receives a complete `meta_info`.
+            'micro_batch_size': self.config.rollout.log_prob_micro_batch_size,
+            'max_token_len': self.config.rollout.log_prob_max_token_len_per_gpu,
+            'use_dynamic_bsz': self.config.rollout.log_prob_use_dynamic_bsz,
+            'temperature': self.config.rollout.temperature,
+        }
         data.meta_info.update(meta_info)
 
         with self.ulysses_sharding_manager:
@@ -525,14 +598,20 @@ class ActorRolloutRefWorker(Worker):
             os.makedirs(local_path, exist_ok=True)
             self.actor_module.save_pretrained(local_path, state_dict=state_dict)
             self.tokenizer.save_pretrained(local_path)
-            if hdfs_path is not None:
-                print(f'Uploading actor checkpoint to {hdfs_path}')
-                hdfs_io.makedirs(hdfs_path, exist_ok=True)
-                hdfs_io.copy(src=local_path, dst=hdfs_path)
 
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+        self._save_actor_training_state(local_path)
+        torch.distributed.barrier()
+        if hdfs_path is not None and self.rank == 0:
+            print(f'Uploading actor checkpoint to {hdfs_path}')
+            hdfs_io.makedirs(hdfs_path, exist_ok=True)
+            hdfs_io.copy(src=local_path, dst=hdfs_path)
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_pretrained_model(self, checkpoint_path):
@@ -709,23 +788,74 @@ class CriticWorker(Worker):
 
         return critic_module, critic_optimizer, critic_lr_scheduler
 
+    def _get_critic_resume_path(self):
+        resume_path = self.config.get('resume_from_path', None)
+        if resume_path in (None, '', 'null'):
+            return None
+        return resume_path
+
+    def _get_optimizer_shard_path(self, checkpoint_path: str, prefix: str) -> str:
+        return os.path.join(checkpoint_path, f'{prefix}_optimizer_rank_{self.rank:05d}.pt')
+
+    def _get_scheduler_state_path(self, checkpoint_path: str, prefix: str) -> str:
+        return os.path.join(checkpoint_path, f'{prefix}_lr_scheduler.pt')
+
+    def _save_critic_training_state(self, local_path: str):
+        os.makedirs(local_path, exist_ok=True)
+        optimizer_state_path = self._get_optimizer_shard_path(local_path, 'critic')
+        torch.save(_recursive_to_cpu(self.critic_optimizer.state_dict()), optimizer_state_path)
+
+        if self.rank == 0:
+            scheduler_state_path = self._get_scheduler_state_path(local_path, 'critic')
+            torch.save(self.critic_lr_scheduler.state_dict(), scheduler_state_path)
+
+    def _load_critic_training_state(self, checkpoint_path: str):
+        local_path = copy_local_path_from_hdfs(checkpoint_path)
+        optimizer_state_path = self._get_optimizer_shard_path(local_path, 'critic')
+        scheduler_state_path = self._get_scheduler_state_path(local_path, 'critic')
+
+        if not os.path.exists(optimizer_state_path):
+            raise FileNotFoundError(f'Critic optimizer state not found: {optimizer_state_path}')
+        if not os.path.exists(scheduler_state_path):
+            raise FileNotFoundError(f'Critic scheduler state not found: {scheduler_state_path}')
+
+        optimizer_state = torch.load(optimizer_state_path, map_location='cpu')
+        scheduler_state = torch.load(scheduler_state_path, map_location='cpu')
+        self.critic_optimizer.load_state_dict(optimizer_state)
+        self.critic_lr_scheduler.load_state_dict(scheduler_state)
+        print(f'[RESUME] Loaded critic optimizer and scheduler state from {local_path} on rank {self.rank}')
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get('external_lib', None))
 
+        critic_resume_path = self._get_critic_resume_path()
+        original_model_path = self.config.model.path
+        if critic_resume_path is not None:
+            OmegaConf.set_struct(self.config, False)
+            self.config.model.path = critic_resume_path
+            OmegaConf.set_struct(self.config, True)
         from verl.workers.critic import DataParallelPPOCritic
-        self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(
-            self.config)
+        try:
+            self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(
+                self.config)
+        finally:
+            OmegaConf.set_struct(self.config, False)
+            self.config.model.path = original_model_path
+            OmegaConf.set_struct(self.config, True)
 
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.critic_optimizer)
 
         self.critic = DataParallelPPOCritic(config=self.config,
                                             critic_module=self.critic_module,
                                             critic_optimizer=self.critic_optimizer)
+        if critic_resume_path is not None:
+            self._load_critic_training_state(critic_resume_path)
+
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.critic_optimizer)
 
         self.flops_counter = FlopsCounter(self.critic_model_config)
 
@@ -812,14 +942,20 @@ class CriticWorker(Worker):
             os.makedirs(local_path, exist_ok=True)
             self.critic_module._fsdp_wrapped_module.save_pretrained(local_path, state_dict=state_dict)
             self.tokenizer.save_pretrained(local_path)
-            if hdfs_path is not None:
-                print(f'Uploading critic checkpoint to {hdfs_path}')
-                hdfs_io.makedirs(hdfs_path, exist_ok=True)
-                hdfs_io.copy(src=local_path, dst=hdfs_path)
 
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=torch.cuda.current_device())
+        self._save_critic_training_state(local_path)
+        torch.distributed.barrier()
+        if hdfs_path is not None and self.rank == 0:
+            print(f'Uploading critic checkpoint to {hdfs_path}')
+            hdfs_io.makedirs(hdfs_path, exist_ok=True)
+            hdfs_io.copy(src=local_path, dst=hdfs_path)
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.critic_optimizer)
 
 
 # TODO(sgm): we may need to extract it to dp_reward_model.py

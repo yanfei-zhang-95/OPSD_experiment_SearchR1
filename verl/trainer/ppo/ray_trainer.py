@@ -33,6 +33,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
+from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
@@ -80,6 +81,7 @@ class ResourcePoolManager:
 
 
 import torch
+import verl.utils.hdfs_io as hdfs_io
 from verl.utils.torch_functional import masked_mean
 
 
@@ -166,6 +168,56 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         opsd_multipliers = (1.0 - opsd_mix_lambda) + opsd_mix_lambda * opsd_clipped_weights
         shaped_advantages = advantages * opsd_multipliers
         shaped_advantages = shaped_advantages * response_mask
+
+        opsd_step_advantage_norm = str(data.meta_info.get('opsd_step_advantage_norm', 'none'))
+        if opsd_step_advantage_norm not in ('none', 'equal_step_mean_abs'):
+            raise ValueError(
+                f"Unsupported opsd_step_advantage_norm={opsd_step_advantage_norm}. "
+                "Expected 'none' or 'equal_step_mean_abs'."
+            )
+        if opsd_step_advantage_norm == 'equal_step_mean_abs':
+            opsd_kl_data = data.non_tensor_batch.get('opsd_kl_data', None)
+            if opsd_kl_data is not None:
+                opsd_step_advantage_norm_eps = float(data.meta_info.get('opsd_step_advantage_norm_eps', 1e-6))
+                opsd_step_advantage_coef_clip = float(data.meta_info.get('opsd_step_advantage_coef_clip', 2.0))
+                clip_min = 1.0 / max(opsd_step_advantage_coef_clip, 1.0)
+                clip_max = max(opsd_step_advantage_coef_clip, 1.0)
+
+                normalized_advantages = shaped_advantages.clone()
+                batch_size = normalized_advantages.size(0)
+                for batch_idx in range(min(batch_size, len(opsd_kl_data))):
+                    step_list = opsd_kl_data[batch_idx]
+                    if not step_list or len(step_list) <= 1:
+                        continue
+
+                    step_spans = []
+                    step_mean_abs = []
+                    for step in step_list:
+                        start_idx = int(step.get('target_token_start_idx', -1))
+                        end_idx = int(step.get('target_token_end_idx', -1))
+                        if end_idx < start_idx:
+                            continue
+
+                        step_mask = response_mask[batch_idx, start_idx:end_idx + 1] > 0
+                        if not torch.any(step_mask):
+                            continue
+
+                        step_values = normalized_advantages[batch_idx, start_idx:end_idx + 1][step_mask]
+                        step_spans.append((start_idx, end_idx))
+                        step_mean_abs.append(step_values.abs().mean())
+
+                    if len(step_mean_abs) <= 1:
+                        continue
+
+                    step_mean_abs_tensor = torch.stack(step_mean_abs)
+                    target_mean_abs = step_mean_abs_tensor.mean()
+                    step_coefs = target_mean_abs / (step_mean_abs_tensor + opsd_step_advantage_norm_eps)
+                    step_coefs = torch.clamp(step_coefs, min=clip_min, max=clip_max)
+
+                    for (start_idx, end_idx), step_coef in zip(step_spans, step_coefs):
+                        normalized_advantages[batch_idx, start_idx:end_idx + 1] *= step_coef
+
+                shaped_advantages = normalized_advantages * response_mask
 
         data.batch['opsd_token_weights'] = opsd_clipped_weights * response_mask
         data.batch['advantages'] = shaped_advantages
@@ -362,6 +414,14 @@ class RayPPOTrainer(object):
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
+        self.resume_from_path = self._get_resume_path()
+        self.resume_state = None
+        self.resume_epoch = 0
+        self.resume_batch_offset = 0
+        self.resume_next_global_step = None
+
+        if self.resume_from_path is not None:
+            self._configure_resume()
 
         # define KL control
         if self.use_reference_policy:
@@ -377,15 +437,54 @@ class RayPPOTrainer(object):
         else:
             self.kl_ctrl = core_algos.FixedKLController(kl_coef=0.)
 
+        if self.resume_state is not None and 'kl_ctrl_value' in self.resume_state:
+            self.kl_ctrl.value = float(self.resume_state['kl_ctrl_value'])
+
         self._create_dataloader()
         self._init_logger()
+
+    def _get_resume_path(self):
+        resume_path = self.config.trainer.get('resume_from_path', None)
+        if resume_path in (None, '', 'null'):
+            return None
+        return str(resume_path)
+
+    def _get_trainer_state_path(self, actor_checkpoint_path: str) -> str:
+        return os.path.join(actor_checkpoint_path, 'trainer_state.pt')
+
+    def _derive_critic_resume_path(self, actor_checkpoint_path: str) -> str:
+        step_dir = os.path.basename(actor_checkpoint_path.rstrip('/'))
+        run_root = os.path.dirname(os.path.dirname(actor_checkpoint_path.rstrip('/')))
+        return os.path.join(run_root, 'critic', step_dir)
+
+    def _load_trainer_state(self, actor_checkpoint_path: str):
+        local_actor_path = copy_local_path_from_hdfs(actor_checkpoint_path)
+        trainer_state_path = self._get_trainer_state_path(local_actor_path)
+        if not os.path.exists(trainer_state_path):
+            raise FileNotFoundError(f'Trainer state not found: {trainer_state_path}')
+        return torch.load(trainer_state_path, map_location='cpu')
+
+    def _configure_resume(self):
+        self.resume_state = self._load_trainer_state(self.resume_from_path)
+        last_saved_step = int(self.resume_state['global_steps'])
+        self.resume_next_global_step = last_saved_step + 1
+
+        with open_dict(self.config):
+            self.config.actor_rollout_ref.actor.resume_from_path = self.resume_from_path
+            if self.config.algorithm.adv_estimator == 'gae':
+                self.config.critic.resume_from_path = self._derive_critic_resume_path(self.resume_from_path)
+
+        print(f'[RESUME] Preparing to resume from {self.resume_from_path}. '
+              f'Last saved global step={last_saved_step}, next step={self.resume_next_global_step}.')
     
     def _init_logger(self):
         from verl.utils.tracking import Tracking
         self.logger = Tracking(project_name=self.config.trainer.project_name,
                           experiment_name=self.config.trainer.experiment_name,
                           default_backend=self.config.trainer.logger,
-                          config=OmegaConf.to_container(self.config, resolve=True))
+                          config=OmegaConf.to_container(self.config, resolve=True),
+                          wandb_run_id=self.config.trainer.get('wandb_run_id', None),
+                          wandb_resume=self.config.trainer.get('wandb_resume', None))
 
     def _create_dataloader(self):
         from torch.utils.data import DataLoader
@@ -405,11 +504,18 @@ class RayPPOTrainer(object):
                 self.train_dataset.dataframe = self.train_dataset.dataframe.sample(self.config.data.train_data_num, random_state=42)
         print(f"filtered training dataset size: {len(self.train_dataset.dataframe)}")
 
+        train_generator = None
+        if self.config.data.shuffle_train_dataloader:
+            train_seed = int(self.config.trainer.get('seed', 42))
+            train_generator = torch.Generator()
+            train_generator.manual_seed(train_seed)
+
         self.train_dataloader = DataLoader(dataset=self.train_dataset,
                                            batch_size=self.config.data.train_batch_size,
                                            shuffle=self.config.data.shuffle_train_dataloader,
                                            drop_last=True,
-                                           collate_fn=collate_fn)
+                                           collate_fn=collate_fn,
+                                           generator=train_generator)
 
         self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
                                        tokenizer=self.tokenizer,
@@ -445,6 +551,12 @@ class RayPPOTrainer(object):
 
         self.total_training_steps = total_training_steps
         print(f'Total training steps: {self.total_training_steps}')
+
+        if self.resume_next_global_step is not None:
+            completed_steps = max(0, self.resume_next_global_step - 1)
+            self.resume_epoch = completed_steps // len(self.train_dataloader)
+            self.resume_batch_offset = completed_steps % len(self.train_dataloader)
+            print(f'[RESUME] Will skip to epoch {self.resume_epoch}, batch offset {self.resume_batch_offset}.')
 
         OmegaConf.set_struct(self.config, True)
         with open_dict(self.config):
@@ -487,6 +599,151 @@ class RayPPOTrainer(object):
                 'max_token_len': seq_len,
             }
         )
+
+    def _format_opsd_token_for_display(self, token_id: int) -> str:
+        token_text = self.tokenizer.decode([int(token_id)], skip_special_tokens=False)
+        if token_text == '':
+            token_text = self.tokenizer.convert_ids_to_tokens([int(token_id)])[0]
+        token_text = token_text.replace("\n", "\\n").replace("\t", "\\t")
+        return token_text
+
+    def _annotate_opsd_trajectory_spans(
+        self,
+        text: str,
+        step_char_span: tuple[int, int],
+        action_char_span: tuple[int, int],
+    ) -> str:
+        text_len = len(text)
+        step_start, step_end = step_char_span
+        action_start, action_end = action_char_span
+
+        def _clip(idx: int) -> int:
+            return max(0, min(int(idx), text_len))
+
+        markers = [
+            (_clip(step_start), "[STEP_START]"),
+            (_clip(action_start), "[ACTION_START]"),
+            (_clip(action_end), "[ACTION_END]"),
+            (_clip(step_end), "[STEP_END]"),
+        ]
+        markers.sort(key=lambda x: (x[0], x[1]))
+
+        parts = []
+        cursor = 0
+        for idx, marker in markers:
+            if idx < cursor:
+                idx = cursor
+            parts.append(text[cursor:idx])
+            parts.append(marker)
+            cursor = idx
+        parts.append(text[cursor:])
+        return "".join(parts).replace("\n", "\\n")
+
+    def _format_opsd_delta_case_report(self, case: dict, delta_threshold: float) -> str:
+        changed_entries = []
+        unchanged_entries = []
+        ordered_entries = []
+
+        for token_idx, (token_id, delta_val, student_lp, teacher_lp) in enumerate(
+                zip(case['token_ids'], case['delta'], case['student_logprob'], case['teacher_logprob'])):
+            token_text = self._format_opsd_token_for_display(token_id)
+            status = 'changed' if abs(delta_val) > delta_threshold else 'unchanged'
+            entry = (
+                f"{token_idx:02d} | token={repr(token_text)} | "
+                f"status={status} | delta={delta_val:+.4f} | "
+                f"student_lp={student_lp:+.4f} | teacher_lp={teacher_lp:+.4f}"
+            )
+            ordered_entries.append(entry)
+            if abs(delta_val) > delta_threshold:
+                changed_entries.append(entry)
+            else:
+                unchanged_entries.append(entry)
+
+        def _render_entries(entries: list[str]) -> str:
+            if not entries:
+                return 'None'
+            return "\n".join(entries)
+
+        step_preview = case['step_text'].replace("\n", "\\n")
+        trajectory_preview = case['full_trajectory_text'].replace("\n", "\\n")
+        annotated_trajectory_preview = self._annotate_opsd_trajectory_spans(
+            case['full_trajectory_text'],
+            case['step_char_span'],
+            case['target_char_span'],
+        )
+        action_preview = case['action_text'].replace("\n", "\\n")
+        target_preview = case['target_text'].replace("\n", "\\n")
+        return (
+            "[OPSD DELTA REPORT] Sampled Case\n"
+            f"[Batch Idx] {case['batch_idx']}\n"
+            f"[Step Idx] {case['step_idx']}\n"
+            f"[Action Type] {case['action_type']}\n"
+            f"[Target Span Mode] {case['target_span_mode']}\n"
+            f"[Changed Tokens] {len(changed_entries)} / {len(case['token_ids'])}\n"
+            f"[Step Char Span] {case['step_char_span'][0]} -> {case['step_char_span'][1]}\n"
+            f"[Action Char Span] {case['action_char_span'][0]} -> {case['action_char_span'][1]}\n"
+            f"[Target Char Span] {case['target_char_span'][0]} -> {case['target_char_span'][1]}\n"
+            f"[Step Text]\n{step_preview}\n"
+            f"[Action Text]\n{action_preview}\n"
+            f"[Target Text]\n{target_preview}\n"
+            f"[Full Trajectory]\n{trajectory_preview}\n"
+            f"[Annotated Trajectory]\n{annotated_trajectory_preview}\n"
+            "[All Token Details In Order]\n"
+            f"{_render_entries(ordered_entries)}\n"
+            "[Changed Token Details]\n"
+            f"{_render_entries(changed_entries)}\n"
+            "[Unchanged Token Details]\n"
+            f"{_render_entries(unchanged_entries)}\n"
+            + '-' * 80
+        )
+
+    def _build_opsd_delta_report_text(self, delta_values: list[float], sampled_cases: list[dict], delta_threshold: float) -> str:
+        if not delta_values:
+            return ''
+
+        delta_arr = np.asarray(delta_values, dtype=np.float32)
+        abs_delta_arr = np.abs(delta_arr)
+        changed_mask = abs_delta_arr > delta_threshold
+        positive_count = int((delta_arr > delta_threshold).sum())
+        negative_count = int((delta_arr < -delta_threshold).sum())
+        unchanged_count = int((~changed_mask).sum())
+
+        report_sections = [
+            (
+                "[OPSD DELTA REPORT] Summary\n"
+                f"[Token Count] {delta_arr.size}\n"
+                f"[Change Threshold] {delta_threshold:.2e}\n"
+                f"[Mean] {delta_arr.mean():+.6f}\n"
+                f"[Std] {delta_arr.std():.6f}\n"
+                f"[Min, Max] {delta_arr.min():+.6f}, {delta_arr.max():+.6f}\n"
+                f"[Abs Mean, Abs Median] {abs_delta_arr.mean():.6f}, {np.median(abs_delta_arr):.6f}\n"
+                f"[P05, P25, P50, P75, P95] "
+                f"{np.percentile(delta_arr, 5):+.6f}, "
+                f"{np.percentile(delta_arr, 25):+.6f}, "
+                f"{np.percentile(delta_arr, 50):+.6f}, "
+                f"{np.percentile(delta_arr, 75):+.6f}, "
+                f"{np.percentile(delta_arr, 95):+.6f}\n"
+                f"[Positive, Negative, Unchanged] {positive_count}, {negative_count}, {unchanged_count}\n"
+                f"[Changed Ratio] {changed_mask.mean():.4f}\n"
+                + '-' * 80
+            )
+        ]
+        for case in sampled_cases:
+            report_sections.append(self._format_opsd_delta_case_report(case, delta_threshold=delta_threshold))
+        return "\n".join(report_sections)
+
+    def _print_opsd_delta_report(self, delta_values: list[float], sampled_cases: list[dict], delta_threshold: float):
+        report_text = self._build_opsd_delta_report_text(
+            delta_values=delta_values,
+            sampled_cases=sampled_cases,
+            delta_threshold=delta_threshold,
+        )
+        if not report_text:
+            return
+
+        print(report_text)
+        if getattr(self, '_opsd_validate_report_sink', None) is not None:
+            self._opsd_validate_report_sink.append(report_text)
 
     def _apply_opsd_token_level_kl(self, batch: DataProto):
         if 'opsd_kl_data' not in batch.non_tensor_batch:
@@ -554,10 +811,27 @@ class RayPPOTrainer(object):
                     'batch_idx': batch_idx,
                     'step_idx': step_idx,
                     'resp_len': response_ids.numel(),
-                    'step_token_start_idx': step['token_start_idx'],
-                    'step_token_end_idx': step['clean_step_token_end_idx'],
+                    'step_token_start_idx': step['target_token_start_idx'],
+                    'step_token_end_idx': step['target_token_end_idx'],
                     'reward_anchor_idx': step['token_end_idx'],
                     'student_scoring_mode': opsd_student_scoring_mode,
+                    'action_type': step.get('action_type', 'unknown'),
+                    'target_span_mode': step.get('target_span_mode', 'clean_step_no_observation'),
+                    'full_trajectory_text': step.get('full_trajectory_text', ''),
+                    'action_text': step.get('action_str', ''),
+                    'target_text': step.get('target_text', clean_step_text),
+                    'step_char_span': (
+                        step.get('step_start_char_idx', -1),
+                        step.get('step_end_char_idx', -1),
+                    ),
+                    'action_char_span': (
+                        step.get('action_start_char_idx', -1),
+                        step.get('action_end_char_idx', -1),
+                    ),
+                    'target_char_span': (
+                        step.get('target_char_start_idx', -1),
+                        step.get('target_char_end_idx', -1),
+                    ),
                 }
                 step_records.append({
                     'student_ids': student_ids,
@@ -571,9 +845,17 @@ class RayPPOTrainer(object):
                         'student_context': self.tokenizer.decode(student_context_ids, skip_special_tokens=False)
                         if student_context_ids is not None else '',
                         'teacher_context': self.tokenizer.decode(teacher_context_ids, skip_special_tokens=False),
-                        'target_response': clean_step_text,
-                        'step_token_start_idx': step['token_start_idx'],
-                        'step_token_end_idx': step['clean_step_token_end_idx'],
+                        'full_trajectory_text': step.get('full_trajectory_text', ''),
+                        'step_text': step.get('step_text', ''),
+                        'action_text': step.get('action_str', ''),
+                        'target_text': step.get('target_text', clean_step_text),
+                        'target_span_mode': step.get('target_span_mode', 'clean_step_no_observation'),
+                        'target_response': step.get('target_text', clean_step_text),
+                        'step_token_start_idx': step['target_token_start_idx'],
+                        'step_token_end_idx': step['target_token_end_idx'],
+                        'step_char_span': (step.get('step_start_char_idx', -1), step.get('step_end_char_idx', -1)),
+                        'action_char_span': (step.get('action_start_char_idx', -1), step.get('action_end_char_idx', -1)),
+                        'target_char_span': (step.get('target_char_start_idx', -1), step.get('target_char_end_idx', -1)),
                     })
 
         if not step_records:
@@ -587,6 +869,14 @@ class RayPPOTrainer(object):
                 f"[Student Scoring Mode] {opsd_student_scoring_mode}\n"
                 f"[Student Context]\n{ex['student_context']}\n"
                 f"[Teacher Context]\n{ex['teacher_context']}\n"
+                f"[Full Trajectory]\n{ex['full_trajectory_text']}\n"
+                f"[Original Step Text]\n{ex['step_text']}\n"
+                f"[Action Text]\n{ex['action_text']}\n"
+                f"[Target Span Mode] {ex['target_span_mode']}\n"
+                f"[Target Text]\n{ex['target_text']}\n"
+                f"[Step Char Span] {ex['step_char_span'][0]} -> {ex['step_char_span'][1]}\n"
+                f"[Action Char Span] {ex['action_char_span'][0]} -> {ex['action_char_span'][1]}\n"
+                f"[Target Char Span] {ex['target_char_span'][0]} -> {ex['target_char_span'][1]}\n"
                 f"[Target Response]\n{ex['target_response']}\n"
                 f"[Step Token Span] {ex['step_token_start_idx']} -> {ex['step_token_end_idx']}\n"
                 + "-" * 80
@@ -595,6 +885,18 @@ class RayPPOTrainer(object):
         opsd_token_delta = torch.zeros_like(batch.batch['token_level_scores'], dtype=torch.float32)
         total_step_records = len(step_records)
         total_chunks = (total_step_records + opsd_logprob_chunk_size - 1) // opsd_logprob_chunk_size
+        try:
+            opsd_report_delta_threshold = float(self.config.algorithm.opsd_report_delta_threshold)
+        except Exception:
+            opsd_report_delta_threshold = 1e-4
+        try:
+            opsd_report_case_count = int(self.config.algorithm.opsd_report_case_count)
+        except Exception:
+            opsd_report_case_count = 8
+        opsd_report_case_count = max(1, opsd_report_case_count)
+        delta_values = []
+        sampled_cases = []
+        seen_case_count = 0
 
         print(
             "[OPSD KL DEBUG] Chunked LogProb Recompute\n"
@@ -682,9 +984,39 @@ class RayPPOTrainer(object):
 
                 delta = (teacher_lp - student_lp).detach().float()
                 opsd_token_delta[batch_idx, step_start:step_start + shared_len] = delta
+                delta_cpu = delta.cpu()
+                student_lp_cpu = student_lp.detach().float().cpu()
+                teacher_lp_cpu = teacher_lp.detach().float().cpu()
+                token_ids = batch.batch['responses'][batch_idx, step_start:step_start + shared_len].detach().cpu().tolist()
+                delta_values.extend(delta_cpu.tolist())
+
+                case_payload = {
+                    'batch_idx': batch_idx,
+                    'step_idx': meta['step_idx'],
+                    'action_type': meta.get('action_type', 'unknown'),
+                    'target_span_mode': meta.get('target_span_mode', 'clean_step_no_observation'),
+                    'full_trajectory_text': meta.get('full_trajectory_text', ''),
+                    'step_text': self.tokenizer.decode(token_ids, skip_special_tokens=False),
+                    'action_text': meta.get('action_text', ''),
+                    'target_text': meta.get('target_text', self.tokenizer.decode(token_ids, skip_special_tokens=False)),
+                    'step_char_span': meta.get('step_char_span', (-1, -1)),
+                    'action_char_span': meta.get('action_char_span', (-1, -1)),
+                    'target_char_span': meta.get('target_char_span', (-1, -1)),
+                    'token_ids': token_ids,
+                    'delta': delta_cpu.tolist(),
+                    'student_logprob': student_lp_cpu.tolist(),
+                    'teacher_logprob': teacher_lp_cpu.tolist(),
+                }
+                seen_case_count += 1
+                if len(sampled_cases) < opsd_report_case_count:
+                    sampled_cases.append(case_payload)
+                else:
+                    replace_idx = np.random.randint(0, seen_case_count)
+                    if replace_idx < len(sampled_cases):
+                        sampled_cases[replace_idx] = case_payload
+
                 if batch_idx == 0 and meta['step_idx'] < 3:
-                    step_tokens = batch.batch['responses'][batch_idx, step_start:step_start + shared_len].tolist()
-                    step_text = self.tokenizer.decode(step_tokens, skip_special_tokens=False)
+                    step_text = case_payload['step_text']
                     print(
                         "[OPSD KL DEBUG] Token-Level KL\n"
                         f"[Step Idx] {meta['step_idx']}\n"
@@ -713,6 +1045,11 @@ class RayPPOTrainer(object):
             if student_log_probs is not None:
                 del student_log_probs
 
+        self._print_opsd_delta_report(
+            delta_values=delta_values,
+            sampled_cases=sampled_cases,
+            delta_threshold=opsd_report_delta_threshold,
+        )
         batch.batch['opsd_token_delta'] = opsd_token_delta
         return batch
 
@@ -733,6 +1070,7 @@ class RayPPOTrainer(object):
         import torch
         reward_tensor_lst = []
         data_source_lst = []
+        self._opsd_validate_report_sink = []
 
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
@@ -788,6 +1126,9 @@ class RayPPOTrainer(object):
                     
                 # for certain reward function (e.g. sandbox), the generation can overlap with reward
                 reward_tensor = self.val_reward_fn(test_batch)
+                if 'opsd_kl_data' in test_batch.non_tensor_batch:
+                    test_batch.batch['token_level_scores'] = reward_tensor
+                    self._apply_opsd_token_level_kl(test_batch)
 
                 reward_tensor_lst.append(reward_tensor)
                 data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
@@ -827,6 +1168,9 @@ class RayPPOTrainer(object):
                         
                     # for certain reward function (e.g. sandbox), the generation can overlap with reward
                     reward_tensor = self.val_reward_fn(test_batch)
+                    if 'opsd_kl_data' in test_batch.non_tensor_batch:
+                        test_batch.batch['token_level_scores'] = reward_tensor
+                        self._apply_opsd_token_level_kl(test_batch)
 
                     reward_tensor_lst.append(reward_tensor)
                     data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
@@ -846,6 +1190,24 @@ class RayPPOTrainer(object):
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
 
+        if self._opsd_validate_report_sink:
+            report_dir = os.path.join(self.config.trainer.default_local_dir, 'opsd_delta_reports')
+            os.makedirs(report_dir, exist_ok=True)
+            report_path = os.path.join(
+                report_dir,
+                f'validation_step_{self.global_steps}_{uuid.uuid4().hex[:8]}.txt',
+            )
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write('OPSD delta validation report\n')
+                f.write(f'global_step={self.global_steps}\n')
+                f.write(f'val_only={bool(self.config.trainer.get("val_only", False))}\n')
+                for metric_name, metric_value in sorted(metric_dict.items()):
+                    f.write(f'{metric_name}={metric_value}\n')
+                f.write('\n')
+                f.write("\n\n".join(self._opsd_validate_report_sink))
+            print(f'[OPSD DELTA REPORT] Validation report saved to {report_path}')
+
+        self._opsd_validate_report_sink = None
         return metric_dict
 
 
@@ -936,6 +1298,16 @@ class RayPPOTrainer(object):
                 self.config.trainer.default_hdfs_dir, 'critic')
             self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
 
+        trainer_state_path = self._get_trainer_state_path(actor_local_path)
+        torch.save({
+            'global_steps': self.global_steps,
+            'kl_ctrl_value': float(self.kl_ctrl.value),
+        }, trainer_state_path)
+        print(f'[RESUME] Saved trainer state to {trainer_state_path}')
+        if actor_remote_path is not None:
+            hdfs_io.makedirs(actor_remote_path, exist_ok=True)
+            hdfs_io.copy(src=actor_local_path, dst=actor_remote_path)
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch['attention_mask']
@@ -961,18 +1333,40 @@ class RayPPOTrainer(object):
         """
 
         logger = self.logger
-        self.global_steps = 0
+        is_resuming = self.resume_state is not None
+        if is_resuming:
+            self.global_steps = self.resume_next_global_step
+            print(f'[RESUME] Continuing training from global step {self.global_steps}.')
+            if self.global_steps >= self.total_training_steps:
+                print(f'[RESUME] global step {self.global_steps} already reached total_training_steps={self.total_training_steps}. Nothing to do.')
+                return
+        else:
+            self.global_steps = 0
+
+        if is_resuming and self.use_reference_policy:
+            try:
+                opsd_teacher_mode = str(self.config.algorithm.opsd_teacher_mode)
+            except Exception:
+                opsd_teacher_mode = 'stale_ref_policy'
+            if opsd_teacher_mode == 'stale_ref_policy':
+                print(f'[RESUME] Refreshing stale teacher snapshot at global step {self.global_steps}.')
+                self._refresh_opsd_teacher_snapshot()
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+        run_initial_validation = self.config.trainer.get('val_before_train', True)
+        if is_resuming:
+            run_initial_validation = self.config.trainer.get('resume_run_initial_validation', False)
+        if self.val_reward_fn is not None and run_initial_validation:
             val_metrics = self._validate()
             pprint(f'Initial validation metrics: {val_metrics}')
-            logger.log(data=val_metrics, step=self.global_steps)
+            init_val_log_step = self.global_steps if not is_resuming else self.global_steps - 1
+            logger.log(data=val_metrics, step=init_val_log_step)
             if self.config.trainer.get('val_only', False):
                 return
 
         # we start from step 1
-        self.global_steps += 1
+        if not is_resuming:
+            self.global_steps += 1
 
         # Agent config preparation
         gen_config = GenerationConfig(
@@ -994,8 +1388,11 @@ class RayPPOTrainer(object):
         )
 
         # start training loop
-        for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+        start_epoch = self.resume_epoch if is_resuming else 0
+        for epoch in range(start_epoch, self.config.trainer.total_epochs):
+            for batch_idx, batch_dict in enumerate(self.train_dataloader):
+                if is_resuming and epoch == start_epoch and batch_idx < self.resume_batch_offset:
+                    continue
                 print(f'epoch {epoch}, step {self.global_steps}')
                 metrics = {}
                 timing_raw = {}

@@ -24,7 +24,13 @@ from typing import List, Union, Dict, Any
 class Tracking(object):
     supported_backend = ['wandb', 'mlflow', 'console']
 
-    def __init__(self, project_name, experiment_name, default_backend: Union[str, List[str]] = 'console', config=None):
+    def __init__(self,
+                 project_name,
+                 experiment_name,
+                 default_backend: Union[str, List[str]] = 'console',
+                 config=None,
+                 wandb_run_id: str = None,
+                 wandb_resume: str = None):
         if isinstance(default_backend, str):
             default_backend = [default_backend]
         for backend in default_backend:
@@ -42,7 +48,16 @@ class Tracking(object):
             WANDB_API_KEY = os.environ.get("WANDB_API_KEY", None)
             if WANDB_API_KEY:
                 wandb.login(key=WANDB_API_KEY)
-            wandb.init(project=project_name, name=experiment_name, config=config)
+            wandb_init_kwargs = {
+                'project': project_name,
+                'name': experiment_name,
+                'config': config,
+            }
+            if wandb_run_id not in (None, '', 'null'):
+                wandb_init_kwargs['id'] = wandb_run_id
+            if wandb_resume not in (None, '', 'null'):
+                wandb_init_kwargs['resume'] = wandb_resume
+            wandb.init(**wandb_init_kwargs)
             self.logger['wandb'] = wandb
 
         if 'mlflow' in default_backend:

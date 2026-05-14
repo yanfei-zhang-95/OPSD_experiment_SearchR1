@@ -30,6 +30,7 @@ from verl.utils.torch_functional import logprobs_from_logits, masked_mean
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
+from verl.utils.debug import log_gpu_memory_usage
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
@@ -54,6 +55,26 @@ class DataParallelPPOActor(BasePPOActor):
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
+
+    def _log_actor_micro_batch_stats(self, micro_batch, stage: str):
+        attention_mask = micro_batch['attention_mask']
+        input_ids = micro_batch['input_ids']
+        responses = micro_batch['responses']
+        seq_lens = attention_mask.sum(dim=-1)
+        response_len = responses.size(-1)
+        batch_size = input_ids.size(0)
+        print(
+            f"[ACTOR OOM DEBUG] {stage} | "
+            f"batch_size={batch_size}, "
+            f"seq_len_min={int(seq_lens.min().item())}, "
+            f"seq_len_mean={float(seq_lens.float().mean().item()):.1f}, "
+            f"seq_len_max={int(seq_lens.max().item())}, "
+            f"response_len={response_len}, "
+            f"tokens_total={int(seq_lens.sum().item())}, "
+            f"ppo_micro_batch_size={self.config.ppo_micro_batch_size}, "
+            f"gradient_accumulation={self.gradient_accumulation}"
+        )
+        log_gpu_memory_usage(f'Actor memory at {stage}', rank=None)
 
     def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -247,7 +268,11 @@ class DataParallelPPOActor(BasePPOActor):
                 entropy_coeff = self.config.entropy_coeff
 
                 # all return: (bsz, response_length)
-                entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                try:
+                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                except torch.OutOfMemoryError:
+                    self._log_actor_micro_batch_stats(data, stage='oom_during_forward_micro_batch')
+                    raise
 
                 pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
                                                                               log_prob=log_prob,
@@ -273,7 +298,11 @@ class DataParallelPPOActor(BasePPOActor):
                     metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
                 loss = policy_loss / self.gradient_accumulation
-                loss.backward()
+                try:
+                    loss.backward()
+                except torch.OutOfMemoryError:
+                    self._log_actor_micro_batch_stats(data, stage='oom_during_backward')
+                    raise
 
                 data = {
                     'actor/entropy_loss': entropy_loss.detach().item(),
