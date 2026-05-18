@@ -17,7 +17,7 @@ WAND_PROJECT='Search-R1'
 # export EXPERIMENT_NAME=r1-searcher-r1-grpo-qwen2.5-7b-it-em
 
 export BASE_MODEL='/data/huggingface_models/SearchR1-nq_hotpotqa_train-qwen2.5-3b-it-em-grpo'
-export EXPERIMENT_NAME=r1-searcher-r1-grpo-qwen2.5-3b-it-em-RLSDLite-stale-none-sigmoid-clean_step-no_peer_traj
+export EXPERIMENT_NAME=r1-searcher-r1-grpo-qwen2.5-3b-it-em-RLSDLite-stale-none-sigmoid-clean_step-final_answer_only
 
 # export BASE_MODEL='/data/huggingface_models/SearchR1-nq_hotpotqa_train-qwen2.5-3b-em-grpo'
 # export EXPERIMENT_NAME=r1-searcher-r1-grpo-qwen2.5-3b-em-ContinualNoRLSD
@@ -71,7 +71,7 @@ export VLLM_ATTENTION_BACKEND=XFORMERS # vllm + qwen2-7b with flash_attn has som
 #   OPSD_WEIGHT_FN=exp bash train_grpo_4.sh
 # Optional OOM fallback:
 #   +actor_rollout_ref.rollout.opsd_logprob_chunk_size=16
-export OPSD_HINDSIGHT_INCLUDE_FIRST_CORRECT_PEER_TRAJECTORY="${OPSD_HINDSIGHT_INCLUDE_FIRST_CORRECT_PEER_TRAJECTORY:-False}"
+export OPSD_HINDSIGHT_INCLUDE_FIRST_CORRECT_PEER_TRAJECTORY="${OPSD_HINDSIGHT_INCLUDE_FIRST_CORRECT_PEER_TRAJECTORY:-True}"
 export OPSD_HINDSIGHT_INFO_MODE="${OPSD_HINDSIGHT_INFO_MODE:-none}"
 export OPSD_TEACHER_INCLUDE_FINAL_CORRECTNESS="${OPSD_TEACHER_INCLUDE_FINAL_CORRECTNESS:-True}"
 export OPSD_TARGET_SPAN_MODE="${OPSD_TARGET_SPAN_MODE:-clean_step_no_observation}"
