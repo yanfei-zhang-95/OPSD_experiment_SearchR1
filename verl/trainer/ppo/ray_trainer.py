@@ -16,6 +16,7 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import json
 import os
 import uuid
 from contextlib import contextmanager
@@ -157,16 +158,30 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         response_mask = data.batch['attention_mask'][:, -response_length:].float()
 
         opsd_weight_clip = float(data.meta_info.get('opsd_weight_clip', 0.2))
-        opsd_mix_lambda = float(data.meta_info.get('opsd_mix_lambda', 0.0))
+        opsd_mix_lambda = float(data.meta_info.get('opsd_mix_lambda', 1.0))
+        opsd_weight_fn = str(data.meta_info.get('opsd_weight_fn', 'sigmoid'))
 
         signed_delta = torch.sign(advantages) * opsd_token_delta.detach()
-        opsd_raw_weights = torch.exp(signed_delta)
-        opsd_clipped_weights = opsd_raw_weights.clamp(
+        # Compute token-level evidence weights, then apply clipping directly to
+        # the per-token advantage as in RLSD-style reweighting.
+        if opsd_weight_fn == 'sigmoid':
+            opsd_raw_weights = 2.0 * torch.sigmoid(signed_delta)
+        elif opsd_weight_fn == 'exp':
+            opsd_raw_weights = torch.exp(signed_delta)
+        else:
+            raise ValueError(
+                f"Unsupported opsd_weight_fn={opsd_weight_fn}. "
+                "Expected 'sigmoid' or 'exp'."
+            )
+        opsd_token_weights = opsd_raw_weights.clamp(
             min=1.0 - opsd_weight_clip,
             max=1.0 + opsd_weight_clip,
         )
-        opsd_multipliers = (1.0 - opsd_mix_lambda) + opsd_mix_lambda * opsd_clipped_weights
-        shaped_advantages = advantages * opsd_multipliers
+        reweighted_advantages = advantages * opsd_token_weights
+        shaped_advantages = (
+            (1.0 - opsd_mix_lambda) * advantages
+            + opsd_mix_lambda * reweighted_advantages
+        )
         shaped_advantages = shaped_advantages * response_mask
 
         opsd_step_advantage_norm = str(data.meta_info.get('opsd_step_advantage_norm', 'none'))
@@ -219,7 +234,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
 
                 shaped_advantages = normalized_advantages * response_mask
 
-        data.batch['opsd_token_weights'] = opsd_clipped_weights * response_mask
+        data.batch['opsd_token_weights'] = opsd_token_weights * response_mask
         data.batch['advantages'] = shaped_advantages
     return data
 
@@ -1071,6 +1086,8 @@ class RayPPOTrainer(object):
         reward_tensor_lst = []
         data_source_lst = []
         self._opsd_validate_report_sink = []
+        if hasattr(self.val_reward_fn, 'reset_validation_examples'):
+            self.val_reward_fn.reset_validation_examples()
 
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
@@ -1117,6 +1134,8 @@ class RayPPOTrainer(object):
                 print('validation generation end')
 
                 test_batch = test_batch.union(test_output_gen_batch)
+                test_batch.meta_info = dict(getattr(test_batch, 'meta_info', {}) or {})
+                test_batch.meta_info['validate'] = True
 
                 # evaluate using reward_function
                 if hasattr(self.val_reward_fn, "set_rollout_wg"):
@@ -1156,6 +1175,8 @@ class RayPPOTrainer(object):
                         )
                     
                     test_batch = test_batch.union(final_gen_batch_output)
+                    test_batch.meta_info = dict(getattr(test_batch, 'meta_info', {}) or {})
+                    test_batch.meta_info['validate'] = True
                     
                     for key in test_batch.batch.keys():
                         test_batch.batch[key] = test_batch.batch[key].long()
@@ -1189,6 +1210,20 @@ class RayPPOTrainer(object):
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+
+        validation_examples = []
+        if hasattr(self.val_reward_fn, 'pop_validation_examples'):
+            validation_examples = self.val_reward_fn.pop_validation_examples()
+
+        validation_detail_path = self.config.trainer.get('validation_detail_path', None)
+        if validation_detail_path:
+            detail_dir = os.path.dirname(validation_detail_path)
+            if detail_dir:
+                os.makedirs(detail_dir, exist_ok=True)
+            with open(validation_detail_path, 'w', encoding='utf-8') as f:
+                for row in validation_examples:
+                    f.write(json.dumps(row, ensure_ascii=False) + '\n')
+            print(f'[VALIDATION DETAILS] Saved {len(validation_examples)} examples to {validation_detail_path}')
 
         if self._opsd_validate_report_sink:
             report_dir = os.path.join(self.config.trainer.default_local_dir, 'opsd_delta_reports')
@@ -1524,6 +1559,11 @@ class RayPPOTrainer(object):
                             opsd_mix_lambda = opsd_mix_lambda_init
 
                         batch.meta_info['opsd_weight_clip'] = opsd_weight_clip
+                        try:
+                            opsd_weight_fn = str(self.config.algorithm.opsd_weight_fn)
+                        except Exception:
+                            opsd_weight_fn = 'sigmoid'
+                        batch.meta_info['opsd_weight_fn'] = opsd_weight_fn
                         batch.meta_info['opsd_mix_lambda'] = opsd_mix_lambda
 
                         # compute advantages, executed on the driver process

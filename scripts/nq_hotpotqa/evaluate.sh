@@ -17,7 +17,7 @@ set -euo pipefail
 # bash scripts/nq_hotpotqa/evaluate.sh
 
 DEFAULT_EVAL_DATASETS="hotpotqa musique 2wikimultihopqa"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 export N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-4}"
 export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-500}"
 export RETRIEVER_URL="${RETRIEVER_URL:-http://127.0.0.1:8085/retrieve}"
@@ -25,8 +25,9 @@ export RETRIEVER_TOPK="${RETRIEVER_TOPK:-3}"
 export OPSD_STUDENT_SCORING_MODE="${OPSD_STUDENT_SCORING_MODE:-causal_prefix}"
 export OPSD_TARGET_SPAN_MODE="${OPSD_TARGET_SPAN_MODE:-clean_step_no_observation}"
 export OPSD_TEACHER_MODE="${OPSD_TEACHER_MODE:-stale_ref_policy}"
+export OPSD_TEACHER_INCLUDE_FINAL_CORRECTNESS="${OPSD_TEACHER_INCLUDE_FINAL_CORRECTNESS:-False}"
 # export BASE_MODEL="${BASE_MODEL:-/data/huggingface_models/SearchR1-nq_hotpotqa_train-qwen2.5-3b-em-grpo}"
-export BASE_MODEL="${BASE_MODEL:-/data/yanfeizhang/OPSD_experiment/Search-R1/verl_checkpoints/r1-searcher-r1-grpo-qwen2.5-3b-em-ContinualRLSD-golden_rollout-equal_step_mean_abs/actor/global_step_100}"
+export BASE_MODEL="${BASE_MODEL:-/data/yanfeizhang/OPSD_experiment/Search-R1/verl_checkpoints/r1-searcher-r1-grpo-qwen2.5-3b-it-em-ContinualNoRLSD/actor/global_step_200}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export EVAL_LOG_ROOT="${EVAL_LOG_ROOT:-${EVAL_LOG_DIR:-$SCRIPT_DIR/eval_logs}}"
 
@@ -99,6 +100,7 @@ run_eval() {
     local train_files="${TRAIN_FILES:-$data_dir/train.parquet}"
     local val_files="${VAL_FILES:-$data_dir/test.parquet}"
     local log_file="$EVAL_LOG_DIR/${dataset_name}.log"
+    local detail_file="$EVAL_LOG_DIR/${dataset_name}.details.jsonl"
 
     echo "============================================================"
     echo "[EVAL] dataset=$dataset_name"
@@ -107,6 +109,7 @@ run_eval() {
     echo "[EVAL] experiment_tag=$experiment_tag"
     echo "[EVAL] model_tag=$model_tag"
     echo "[EVAL] log_file=$log_file"
+    echo "[EVAL] detail_file=$detail_file"
     echo "============================================================"
 
     if [ ! -f "$train_files" ]; then
@@ -117,6 +120,8 @@ run_eval() {
         echo "[ERROR] Missing val parquet: $val_files"
         exit 1
     fi
+
+    rm -f "$detail_file"
 
     PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
         data.train_files="$train_files" \
@@ -129,6 +134,7 @@ run_eval() {
         data.max_response_length=1024 \
         data.max_start_length=1024 \
         data.max_obs_length=512 \
+        data.return_raw_chat=true \
         data.shuffle_train_dataloader=false \
         algorithm.adv_estimator=grpo \
         actor_rollout_ref.model.path="$BASE_MODEL" \
@@ -154,6 +160,7 @@ run_eval() {
         +algorithm.opsd_student_scoring_mode="$OPSD_STUDENT_SCORING_MODE" \
         +algorithm.opsd_target_span_mode="$OPSD_TARGET_SPAN_MODE" \
         +algorithm.opsd_teacher_mode="$OPSD_TEACHER_MODE" \
+        +algorithm.opsd_teacher_include_final_correctness="$OPSD_TEACHER_INCLUDE_FINAL_CORRECTNESS" \
         actor_rollout_ref.rollout.n_agent=5 \
         actor_rollout_ref.rollout.temperature=1 \
         actor_rollout_ref.actor.state_masking=true \
@@ -161,6 +168,7 @@ run_eval() {
         trainer.logger=[] \
         +trainer.val_only=true \
         +trainer.val_before_train=true \
+        +trainer.validation_detail_path="$detail_file" \
         trainer.default_hdfs_dir=null \
         trainer.n_gpus_per_node="$N_GPUS_PER_NODE" \
         trainer.nnodes=1 \
@@ -174,6 +182,7 @@ run_eval() {
     {
         echo "dataset=$dataset_name"
         echo "log_file=$log_file"
+        echo "detail_file=$detail_file"
         if [ -n "$metric_line" ]; then
             echo "metric=$metric_line"
         else

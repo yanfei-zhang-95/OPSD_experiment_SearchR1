@@ -39,6 +39,7 @@ class RewardManager():
         self.format_score = format_score
         self.actor_rollout_wg = None
         self.config = None
+        self._validation_examples = []
         
         # Anchor logical steps on complete action spans instead of relying on
         # perfectly closed observation blocks, which may be truncated.
@@ -51,6 +52,14 @@ class RewardManager():
     def set_rollout_wg(self, wg):
         """Inject the rollout worker group to allow OPSD to compute hints and alpha scores."""
         self.actor_rollout_wg = wg
+
+    def reset_validation_examples(self):
+        self._validation_examples = []
+
+    def pop_validation_examples(self):
+        validation_examples = self._validation_examples
+        self._validation_examples = []
+        return validation_examples
 
     def _score_to_correctness_label(self, score) -> str:
         try:
@@ -80,7 +89,7 @@ class RewardManager():
         return bool(value)
 
     def _get_hindsight_info_mode(self) -> str:
-        value = 'peer_traj'
+        value = 'none'
         try:
             value = self.config.algorithm.get('opsd_hindsight_info_mode', value)
         except Exception:
@@ -88,15 +97,17 @@ class RewardManager():
 
         normalized = str(value).strip().lower()
         alias_map = {
+            'off': 'none',
+            'disabled': 'none',
             'peer': 'peer_traj',
             'peer_correct_trajectory': 'peer_traj',
             'golden': 'golden_rollout',
             'gold': 'golden_rollout',
         }
         normalized = alias_map.get(normalized, normalized)
-        if normalized in ('peer_traj', 'golden_rollout'):
+        if normalized in ('none', 'peer_traj', 'golden_rollout'):
             return normalized
-        return 'peer_traj'
+        return 'none'
 
     def _normalize_optional_text(self, value) -> Optional[str]:
         if value is None:
@@ -113,17 +124,84 @@ class RewardManager():
         except Exception:
             return None
 
+    def _normalize_ground_truth(self, ground_truth):
+        candidate = ground_truth
+        if isinstance(candidate, dict):
+            candidate = candidate.get('target', candidate.get('golden_answers', candidate))
+        elif hasattr(candidate, 'get'):
+            try:
+                candidate = candidate.get('target', candidate.get('golden_answers', candidate))
+            except Exception:
+                pass
+
+        if isinstance(candidate, (list, tuple, set)):
+            return [str(item).strip() for item in candidate if str(item).strip()]
+
+        normalized = self._normalize_optional_text(candidate)
+        return [normalized] if normalized else []
+
+    def _extract_prompt_text(self, data_item) -> Optional[str]:
+        raw_prompt = data_item.non_tensor_batch.get('raw_prompt', None)
+        if raw_prompt is None:
+            return None
+
+        if hasattr(raw_prompt, 'tolist'):
+            try:
+                raw_prompt = raw_prompt.tolist()
+            except Exception:
+                pass
+
+        if isinstance(raw_prompt, list):
+            prompt_parts = []
+            for message in raw_prompt:
+                content = None
+                if isinstance(message, dict):
+                    content = message.get('content')
+                elif hasattr(message, 'get'):
+                    try:
+                        content = message.get('content')
+                    except Exception:
+                        content = None
+                if content is not None:
+                    prompt_parts.append(str(content))
+            if prompt_parts:
+                return "\n".join(prompt_parts)
+
+        return self._normalize_optional_text(raw_prompt)
+
+    def _extract_question_from_prompt_text(self, prompt_text: Optional[str]) -> Optional[str]:
+        if not prompt_text:
+            return None
+        if 'Question:' in prompt_text:
+            return self._normalize_optional_text(prompt_text.split('Question:', 1)[1])
+        return self._normalize_optional_text(prompt_text)
+
+    def _extract_prediction(self, response_str: str) -> Optional[str]:
+        answer_matches = re.findall(r'<answer>(.*?)</answer>', response_str, re.DOTALL)
+        if answer_matches:
+            return self._normalize_optional_text(answer_matches[-1])
+        return self._normalize_optional_text(response_str)
+
+    def _extract_search_queries(self, response_str: str):
+        search_matches = re.findall(r'<search>(.*?)</search>', response_str, re.DOTALL)
+        return [str(match).strip() for match in search_matches if str(match).strip()]
+
     def _build_teacher_hindsight_suffix_ids(
         self,
         correctness_label: str,
         peer_correct_trajectory: Optional[str] = None,
         golden_rollout: Optional[str] = None,
     ) -> list[int]:
-        hindsight_lines = [
-            "",
-            "<hindsight>",
-            f"final_correctness: {correctness_label}",
-        ]
+        include_final_correctness = self._is_config_flag_enabled(
+            'opsd_teacher_include_final_correctness',
+            default=False,
+        )
+        hindsight_lines = ["", "<hindsight>"]
+        has_hindsight_content = False
+
+        if include_final_correctness:
+            hindsight_lines.append(f"final_correctness: {correctness_label}")
+            has_hindsight_content = True
         if peer_correct_trajectory:
             hindsight_lines.extend([
                 "peer_correct_trajectory:",
@@ -131,6 +209,7 @@ class RewardManager():
                 peer_correct_trajectory.rstrip(),
                 "</peer_correct_trajectory>",
             ])
+            has_hindsight_content = True
         if golden_rollout:
             hindsight_lines.extend([
                 "golden_rollout:",
@@ -138,6 +217,9 @@ class RewardManager():
                 golden_rollout.rstrip(),
                 "</golden_rollout>",
             ])
+            has_hindsight_content = True
+        if not has_hindsight_content:
+            return []
         hindsight_lines.extend([
             "</hindsight>",
             "",
@@ -239,6 +321,11 @@ class RewardManager():
         ]
         if not action_matches:
             return steps
+        final_answer_action_idx = None
+        for reverse_idx in range(len(action_matches) - 1, -1, -1):
+            if action_matches[reverse_idx].group(1) == 'answer':
+                final_answer_action_idx = reverse_idx
+                break
 
         response_len = len(response_str)
         step_start_char_idx = self._advance_past_invalid_feedback(
@@ -296,6 +383,9 @@ class RewardManager():
                     'action_end_char_idx': action_end_char_idx,
                     'action_type': action_match.group(1),
                     'action_str': action_match.group(0),
+                    'is_final_answer_action': (
+                        action_match.group(1) == 'answer' and action_idx == final_answer_action_idx
+                    ),
                 })
 
             step_start_char_idx = self._advance_past_invalid_feedback(
@@ -322,6 +412,7 @@ class RewardManager():
         valid_response_lengths = []
         item_cache = []
         opsd_metadata = []
+        is_validation = bool(getattr(data, 'meta_info', {}).get('validate', False))
 
         batch_size = len(data)
         for i in range(batch_size):
@@ -361,6 +452,24 @@ class RewardManager():
                 'correctness_label': correctness_label,
                 'golden_rollout': self._extract_golden_rollout(extra_info),
             })
+
+            if is_validation:
+                prompt_text = self._extract_prompt_text(data_item)
+                search_queries = self._extract_search_queries(response_str)
+                self._validation_examples.append({
+                    'index': group_key,
+                    'data_source': data_source,
+                    'prompt_text': prompt_text,
+                    'question': self._extract_question_from_prompt_text(prompt_text),
+                    'prediction': self._extract_prediction(response_str),
+                    'ground_truth': self._normalize_ground_truth(ground_truth),
+                    'score': float(score),
+                    'is_correct': bool(float(score) == 1.0),
+                    'search_count': len(search_queries),
+                    'search_queries': search_queries,
+                    'valid_response_length': int(valid_response_length.item()),
+                    'trajectory_text': response_str,
+                })
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
@@ -409,11 +518,21 @@ class RewardManager():
                         opsd_target_span_mode = str(self.config.algorithm.opsd_target_span_mode)
                     except Exception:
                         opsd_target_span_mode = 'clean_step_no_observation'
-                    if opsd_target_span_mode not in ('clean_step_no_observation', 'action_only'):
+                    if opsd_target_span_mode not in (
+                        'clean_step_no_observation',
+                        'action_only',
+                        'answer_only',
+                        'final_answer_only',
+                    ):
                         raise ValueError(
                             f"Unsupported algorithm.opsd_target_span_mode={opsd_target_span_mode}. "
-                            "Expected 'clean_step_no_observation' or 'action_only'."
+                            "Expected 'clean_step_no_observation', 'action_only', 'answer_only', "
+                            "or 'final_answer_only'."
                         )
+                    if opsd_target_span_mode in ('answer_only', 'final_answer_only') and action_type != 'answer':
+                        continue
+                    if opsd_target_span_mode == 'final_answer_only' and not step_segment.get('is_final_answer_action', False):
+                        continue
 
                     # Approximate token indices by tokenizing the corresponding prefixes.
                     step_start_tokens = self.tokenizer.encode(response_str[:step_start_char_idx], add_special_tokens=False)
@@ -440,7 +559,7 @@ class RewardManager():
                     if action_token_end_idx < action_token_start_idx:
                         continue
 
-                    if opsd_target_span_mode == 'action_only':
+                    if opsd_target_span_mode in ('action_only', 'answer_only', 'final_answer_only'):
                         target_token_start_idx = action_token_start_idx
                         target_token_end_idx = action_token_end_idx
                         target_char_start_idx = action_start_char_idx

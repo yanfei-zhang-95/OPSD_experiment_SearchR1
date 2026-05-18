@@ -224,22 +224,42 @@ We recommend evaluating on both in-domain open-domain QA and multi-hop QA benchm
 This subsection is reserved for the current available result from the existing training run. Even if the full experiment suite is not yet complete, the paper should report at least one concrete training result so that the method section is connected to an actual empirical outcome.
 
 \paragraph{Result placeholder.}
-The final version should summarize one currently available model checkpoint and its corresponding validation or test performance. Ideally this includes exact match, average number of turns, valid-action ratio, valid-search count, and any currently logged OPSD statistics.
+Table~\ref{tab:current-result} consolidates the currently relevant
+\texttt{Qwen2.5-3B-Instruct} results. We keep the previously reported baseline
+rows from related project results and additionally append our current
+\textbf{Step-OPSD} result. For the newly added row, only the currently available
+Search-QA checkpoints are filled; unavailable metrics are marked as
+\textit{--}.
 
-\begin{table}[t]
+\begin{table*}[t]
 \centering
 \small
-\begin{tabular}{lccccc}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lccccccc|cccccccc}
 \toprule
-Model & EM & Turns & Valid Act. & Valid Search & Notes \\
+\multirow{2}{*}{Method} & \multicolumn{7}{c|}{ALFWorld} & \multicolumn{8}{c}{Search-QA} \\
+& Pick & Look & Clean & Heat & Cool & Pick2 & Avg & NQ & Triv & Pop & Hotp & 2Wk & MuS & Bam & Avg \\
 \midrule
-Baseline & \textit{--} & \textit{--} & \textit{--} & \textit{--} & \textit{to be filled} \\
-\method{} & \textit{--} & \textit{--} & \textit{--} & \textit{--} & \textit{current run} \\
+\multicolumn{16}{l}{\textit{Qwen2.5-3B-Instruct}} \\
+Vanilla & 44.4 & 11.1 & 6.2 & 15.4 & 28.6 & 12.5 & 21.9 & 24.6 & 48.1 & 31.0 & 26.3 & 25.3 & 7.2 & 59.7 & 31.7 \\
+Skill-Prompt* & 51.7 & 66.7 & 48.4 & 0.0 & 4.3 & 10.0 & 28.9 & 23.7 & 46.2 & 30.6 & 24.4 & 22.1 & 7.5 & 12.5 & 23.9 \\
+OPSD & 48.8 & 41.7 & 16.7 & 0.0 & 15.8 & 16.7 & 28.1 & 0.1 & 0.1 & 0.1 & 0.0 & 0.0 & 0.0 & 0.0 & 0.0 \\
+GRPO & 91.2 & 62.5 & 96.2 & 61.9 & 65.0 & 47.4 & 75.0 & 39.3 & 60.6 & 41.1 & 37.4 & 34.6 & 15.4 & 26.4 & 36.4 \\
+Skill-GRPO & 88.9 & 71.4 & 58.8 & 70.6 & 40.7 & 29.2 & 60.2 & 43.5 & 58.8 & 43.0 & 36.8 & 32.2 & 11.7 & 12.5 & 34.1 \\
+Skill-GRPO* & 94.3 & 57.1 & 100.0 & 66.7 & 73.1 & 57.1 & 80.5 & 44.3 & 59.6 & 44.3 & 39.0 & 36.1 & 14.5 & 14.9 & 36.1 \\
+GRPO+OPSD & 100.0 & 82.4 & 85.7 & 75.0 & 70.0 & 60.0 & 81.2 & 44.9 & 61.2 & 45.2 & 40.4 & 38.5 & 16.0 & 66.1 & 44.6 \\
+Skill-SD & 88.2 & 50.0 & 96.2 & 52.4 & 65.0 & 57.9 & 73.4 & 44.4 & 60.4 & 44.0 & 39.5 & 40.4 & 15.4 & 64.9 & 44.1 \\
+Step-OPSD (ours) & \textit{--} & \textit{--} & \textit{--} & \textit{--} & \textit{--} & \textit{--} & \textit{--} & \textit{--} & \textit{--} & \textit{--} & 36.0 & 39.4 & 17.2 & \textit{--} & 30.9 \\
 \bottomrule
 \end{tabular}
-\caption{Current training result placeholder.}
+}
+\caption{Consolidated results for \texttt{Qwen2.5-3B-Instruct}. We retain the
+existing baseline rows and add the current \textbf{Step-OPSD} result from our
+latest available Search-QA checkpoint. RLSD and SDAR rows are omitted here to
+focus the comparison on prior baselines plus the current step-aware OPSD
+variant.}
 \label{tab:current-result}
-\end{table}
+\end{table*}
 
 \subsection{Self-Awareness Evaluation}
 Since self-awareness is an abstract concept, we operationalize it through observable behavioral proxies. In this paper, an agent is considered more self-aware if it searches more often on questions that genuinely require external information and less often on questions answerable from parametric knowledge alone; if it answers only after sufficient evidence has been accumulated; if it detects invalid or unhelpful actions and recovers with fewer extra turns; and if its search decisions are better calibrated with downstream success. Under this definition, self-awareness is not a hidden mental state but a measurable form of meta-decision quality.

@@ -1,4 +1,5 @@
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+# export CUDA_VISIBLE_DEVICES=4,5,6,7
 # export DATA_DIR='data/nq_search'
 export DATA_DIR='data/r1searcher_stage1'
 
@@ -15,8 +16,8 @@ WAND_PROJECT='Search-R1'
 # export BASE_MODEL='Qwen/Qwen2.5-7B-Instruct'
 # export EXPERIMENT_NAME=r1-searcher-r1-grpo-qwen2.5-7b-it-em
 
-export BASE_MODEL='/data/huggingface_models/SearchR1-nq_hotpotqa_train-qwen2.5-3b-em-grpo'
-export EXPERIMENT_NAME=r1-searcher-r1-grpo-qwen2.5-3b-em-ContinualNoRLSD
+export BASE_MODEL='/data/huggingface_models/SearchR1-nq_hotpotqa_train-qwen2.5-3b-it-em-grpo'
+export EXPERIMENT_NAME=r1-searcher-r1-grpo-qwen2.5-3b-it-em-RLSDLite-stale-none-sigmoid-clean_step-no_peer_traj
 
 # export BASE_MODEL='/data/huggingface_models/SearchR1-nq_hotpotqa_train-qwen2.5-3b-em-grpo'
 # export EXPERIMENT_NAME=r1-searcher-r1-grpo-qwen2.5-3b-em-ContinualNoRLSD
@@ -48,18 +49,36 @@ export VLLM_ATTENTION_BACKEND=XFORMERS # vllm + qwen2-7b with flash_attn has som
 #   Only used when OPSD_HINDSIGHT_INFO_MODE=peer_traj
 #   OPSD_HINDSIGHT_INCLUDE_FIRST_CORRECT_PEER_TRAJECTORY=false bash train_grpo_4.sh
 # Optional hindsight info mode:
+#   none: stale/self teacher sees no extra hindsight text
 #   peer_traj: only for the original peer-trajectory path
 #   golden_rollout: applies to all cases that carry extra_info.golden_rollout
 #   OPSD_HINDSIGHT_INFO_MODE=golden_rollout bash train_grpo_4.sh
+# Optional teacher suffix:
+#   OPSD_TEACHER_INCLUDE_FINAL_CORRECTNESS=true bash train_grpo_4.sh
+# Optional target span:
+#   final_answer_only: only shape the final answer action
+#   answer_only: shape every answer action but skip search actions
+#   action_only: shape every search/answer action but skip reasoning text
+#   clean_step_no_observation: broader shaping over reasoning + action
+#   OPSD_TARGET_SPAN_MODE=answer_only bash train_grpo_4.sh
 # Optional OPSD step advantage normalization:
 #   none: keep the current token-level OPSD shaping only
 #   equal_step_mean_abs: rescale each step after OPSD so step-wise mean(abs(advantage)) matches
 #   OPSD_STEP_ADVANTAGE_NORM=equal_step_mean_abs bash train_grpo_4.sh
+# Optional OPSD weight function:
+#   sigmoid: w_t = 2 * sigmoid(sign(A) * delta)
+#   exp: w_t = exp(sign(A) * delta)
+#   OPSD_WEIGHT_FN=exp bash train_grpo_4.sh
 # Optional OOM fallback:
 #   +actor_rollout_ref.rollout.opsd_logprob_chunk_size=16
-export OPSD_HINDSIGHT_INCLUDE_FIRST_CORRECT_PEER_TRAJECTORY="${OPSD_HINDSIGHT_INCLUDE_FIRST_CORRECT_PEER_TRAJECTORY:-false}"
+export OPSD_HINDSIGHT_INCLUDE_FIRST_CORRECT_PEER_TRAJECTORY="${OPSD_HINDSIGHT_INCLUDE_FIRST_CORRECT_PEER_TRAJECTORY:-False}"
 export OPSD_HINDSIGHT_INFO_MODE="${OPSD_HINDSIGHT_INFO_MODE:-none}"
-export OPSD_STEP_ADVANTAGE_NORM="${OPSD_STEP_ADVANTAGE_NORM:-none}"
+export OPSD_TEACHER_INCLUDE_FINAL_CORRECTNESS="${OPSD_TEACHER_INCLUDE_FINAL_CORRECTNESS:-True}"
+export OPSD_TARGET_SPAN_MODE="${OPSD_TARGET_SPAN_MODE:-clean_step_no_observation}"
+export OPSD_STEP_ADVANTAGE_NORM="${OPSD_STEP_ADVANTAGE_NORM:-equal_step_mean_abs}"
+export OPSD_WEIGHT_CLIP="${OPSD_WEIGHT_CLIP:-0.2}"
+export OPSD_WEIGHT_FN="${OPSD_WEIGHT_FN:-sigmoid}"
+export OPSD_MIX_LAMBDA_INIT="${OPSD_MIX_LAMBDA_INIT:-0.2}"
 
 EXTRA_ARGS=()
 ACTOR_CKPT_DIR="verl_checkpoints/$EXPERIMENT_NAME/actor"
@@ -131,14 +150,16 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     algorithm.no_think_rl=false \
     +algorithm.opsd_student_scoring_mode=causal_prefix \
-    +algorithm.opsd_target_span_mode="clean_step_no_observation" \
+    +algorithm.opsd_target_span_mode="${OPSD_TARGET_SPAN_MODE}" \
     +algorithm.opsd_teacher_mode=stale_ref_policy \
     +algorithm.opsd_teacher_refresh_interval=10 \
-    +algorithm.opsd_weight_clip=0.2 \
-    +algorithm.opsd_mix_lambda_init=0 \
-    +algorithm.opsd_mix_lambda_decay_steps=200 \
+    +algorithm.opsd_weight_clip=${OPSD_WEIGHT_CLIP} \
+    +algorithm.opsd_weight_fn=${OPSD_WEIGHT_FN} \
+    +algorithm.opsd_mix_lambda_init=${OPSD_MIX_LAMBDA_INIT} \
+    +algorithm.opsd_mix_lambda_decay_steps=50 \
     +algorithm.opsd_hindsight_include_first_correct_peer_trajectory=${OPSD_HINDSIGHT_INCLUDE_FIRST_CORRECT_PEER_TRAJECTORY} \
     +algorithm.opsd_hindsight_info_mode=${OPSD_HINDSIGHT_INFO_MODE} \
+    +algorithm.opsd_teacher_include_final_correctness=${OPSD_TEACHER_INCLUDE_FINAL_CORRECTNESS} \
     +algorithm.opsd_step_advantage_norm=${OPSD_STEP_ADVANTAGE_NORM} \
     actor_rollout_ref.rollout.n_agent=5 \
     actor_rollout_ref.rollout.temperature=1 \
